@@ -348,8 +348,12 @@ fn run_return(args: &[&str]) -> color_eyre::Result<()> {
 /// Open Cursor on `path` as `cd {path} && cursor .`, without waiting for the
 /// editor window to close.
 ///
-/// TEMP: IPC hook refresh (`VSCODE_IPC_HOOK_CLI` / `vscode-ipc-*.sock`) is
-/// disabled; any inherited hook is cleared for the child process.
+/// Spawns `cursor` as a child process (not a new shell). The child inherits this
+/// process's environment, including `VSCODE_IPC_HOOK_CLI` when present — required
+/// for the remote CLI inside a Cursor/VS Code terminal.
+///
+/// TEMP: sock-refresh (`newest_vscode_ipc_hook`) stays disabled; we rely on the
+/// inherited hook only.
 pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
     let path = path.as_ref();
     let display_path = path.display().to_string();
@@ -360,11 +364,10 @@ pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // TEMP: disable IPC — do not refresh or inherit VSCODE_IPC_HOOK_CLI.
+    // TEMP: do not refresh VSCODE_IPC_HOOK_CLI; inherit whatever this process has.
     // if let Some(hook) = newest_vscode_ipc_hook() {
     //     cmd.env("VSCODE_IPC_HOOK_CLI", &hook);
     // }
-    cmd.env_remove("VSCODE_IPC_HOOK_CLI");
 
     // Waiting lets us surface silent failures (CLI often exits 0 while printing
     // an error).
