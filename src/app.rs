@@ -255,6 +255,8 @@ pub enum EditFocus {
     Branch,
     IssueId,
     Modules,
+    /// Associated Treehouse worktree (clearable; not editable).
+    Worktree,
 }
 
 #[derive(Debug)]
@@ -434,7 +436,7 @@ impl App {
         match self.view {
             View::TaskList => self.handle_task_list_key(terminal, key)?,
             View::Archive => self.handle_archive_key(key)?,
-            View::Edit => self.handle_edit_key(key)?,
+            View::Edit => self.handle_edit_key(terminal, key)?,
             View::CreatePrompt => self.handle_create_prompt_key(key)?,
             View::CredentialPrompt => self.handle_credential_prompt_key(key)?,
             View::CredentialFileBroken => self.handle_credential_file_broken_key(key)?,
@@ -891,7 +893,11 @@ impl App {
         Ok(())
     }
 
-    fn handle_edit_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+    fn handle_edit_key(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        key: KeyEvent,
+    ) -> color_eyre::Result<()> {
         // Crossterm BackTab is not mapped by tui-textarea's Key enum.
         if matches!(key.code, KeyCode::BackTab) {
             self.edit_focus_prev();
@@ -939,7 +945,7 @@ impl App {
                     ..
                 },
             ) => {
-                self.edit_module_move(1);
+                self.edit_module_move_or_leave(1);
                 return Ok(());
             }
             (Some(EditFocus::Modules), Input { key: Key::Up, .. })
@@ -952,7 +958,26 @@ impl App {
                     ..
                 },
             ) => {
-                self.edit_module_move(-1);
+                self.edit_module_move_or_leave(-1);
+                return Ok(());
+            }
+            (
+                Some(EditFocus::Worktree),
+                Input {
+                    key: Key::Delete | Key::Backspace,
+                    ..
+                },
+            )
+            | (
+                Some(EditFocus::Worktree),
+                Input {
+                    key: Key::Char('d' | 'D' | 'x' | 'X'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.clear_edit_worktree_association(terminal)?;
                 return Ok(());
             }
             // Up/Down move between fields even while a text input is focused.
@@ -986,7 +1011,7 @@ impl App {
                 return Ok(());
             }
             (
-                Some(EditFocus::Modules),
+                Some(EditFocus::Modules | EditFocus::Worktree),
                 Input {
                     key: Key::Char('q' | 'Q'),
                     ctrl: false,
@@ -1022,7 +1047,7 @@ impl App {
             EditFocus::Title => edit.title_input.input(input),
             EditFocus::Branch => edit.branch_input.input(input),
             EditFocus::IssueId => edit.issue_input.input(input),
-            EditFocus::Modules => false,
+            EditFocus::Modules | EditFocus::Worktree => false,
         };
         if modified {
             self.sync_edit_inputs_to_task()?;
@@ -1049,7 +1074,8 @@ impl App {
             EditFocus::Title => EditFocus::Branch,
             EditFocus::Branch => EditFocus::IssueId,
             EditFocus::IssueId => EditFocus::Modules,
-            EditFocus::Modules => EditFocus::Title,
+            EditFocus::Modules => EditFocus::Worktree,
+            EditFocus::Worktree => EditFocus::Title,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
             edit.module_cursor = edit
@@ -1062,30 +1088,52 @@ impl App {
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
+        let from_worktree = edit.focus == EditFocus::Worktree;
         edit.focus = match edit.focus {
-            EditFocus::Title => EditFocus::Modules,
+            EditFocus::Title => EditFocus::Worktree,
             EditFocus::Branch => EditFocus::Title,
             EditFocus::IssueId => EditFocus::Branch,
             EditFocus::Modules => EditFocus::IssueId,
+            EditFocus::Worktree => EditFocus::Modules,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
-            edit.module_cursor = edit
-                .module_cursor
-                .min(edit.available_modules.len().saturating_sub(1));
+            if from_worktree {
+                edit.module_cursor = edit.available_modules.len() - 1;
+            } else {
+                edit.module_cursor = edit
+                    .module_cursor
+                    .min(edit.available_modules.len().saturating_sub(1));
+            }
         }
     }
 
-    fn edit_module_move(&mut self, delta: i32) {
-        let Some(edit) = self.edit.as_mut() else {
+    /// Move within the modules list; leave to adjacent fields at the edges.
+    fn edit_module_move_or_leave(&mut self, delta: i32) {
+        let Some(edit) = self.edit.as_ref() else {
             return;
         };
         let len = edit.available_modules.len();
         if len == 0 {
+            if delta > 0 {
+                self.edit_focus_next();
+            } else {
+                self.edit_focus_prev();
+            }
             return;
         }
-        let cur = edit.module_cursor as i32;
-        let next = (cur + delta).rem_euclid(len as i32) as usize;
-        edit.module_cursor = next;
+        let cur = edit.module_cursor;
+        if delta > 0 && cur + 1 >= len {
+            self.edit_focus_next();
+            return;
+        }
+        if delta < 0 && cur == 0 {
+            self.edit_focus_prev();
+            return;
+        }
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+        edit.module_cursor = ((cur as i32) + delta) as usize;
     }
 
     fn edit_confirm_field(&mut self) -> color_eyre::Result<()> {
@@ -1097,10 +1145,65 @@ impl App {
                 // Text already persisted on each keystroke; Enter advances focus.
                 self.edit_focus_next();
             }
-            EditFocus::Modules => {
-                // Enter on modules: no-op (Space toggles).
+            EditFocus::Modules | EditFocus::Worktree => {
+                // Enter on modules/worktree: no-op (Space toggles; D clears worktree).
             }
         }
+        Ok(())
+    }
+
+    /// Drop the task's worktree association without returning it to Treehouse.
+    ///
+    /// Useful when the directory was deleted out from under the app and the
+    /// stale path keeps blocking activate / lease flows.
+    fn clear_edit_worktree_association(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        let Some(wt) = task.worktree.clone() else {
+            self.set_error("No worktree associated with this task");
+            return Ok(());
+        };
+
+        let path_missing = !wt.path.is_dir();
+        if path_missing {
+            let path = wt.path.clone();
+            let _ = self.run_busy(
+                terminal,
+                format!(
+                    "Worktree {} missing on disk; clearing association…",
+                    wt.number
+                ),
+                move || {
+                    switch::cleanup_missing_worktree(&path);
+                    Ok::<(), color_eyre::Report>(())
+                },
+            );
+        }
+
+        let Some(task) = self.tasks.get_mut(task_idx) else {
+            return Ok(());
+        };
+        task.worktree = None;
+        task.touch();
+        persist::save_task(task)?;
+        self.sort_tasks_preserving_edit(task_idx)?;
+        self.set_status(format!(
+            "Cleared worktree {} association{}",
+            wt.number,
+            if path_missing {
+                " (path was missing)"
+            } else {
+                ""
+            }
+        ));
         Ok(())
     }
 

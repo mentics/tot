@@ -242,15 +242,51 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
     );
     frame.render_widget(modules_list, modules);
 
-    let wt_text = match &task.worktree {
-        Some(wt) => format!("Worktree: {} ({})", wt.number, wt.path.display()),
-        None => "Worktree: (none)".to_string(),
+    let wt_focused = focus == EditFocus::Worktree;
+    let (wt_text, wt_hint) = match &task.worktree {
+        Some(wt) => {
+            let line = format!("Worktree: {} ({})", wt.number, wt.path.display());
+            let hint = if wt_focused {
+                "Del/Backspace/D clear association (does not return to Treehouse)"
+            } else {
+                "↓ focus · Del/D clear association"
+            };
+            (line, hint)
+        }
+        None => (
+            "Worktree: (none)".to_string(),
+            if wt_focused {
+                "No association to clear"
+            } else {
+                ""
+            },
+        ),
     };
-    let readonly_widget = Paragraph::new(vec![Line::from(Span::styled(
-        wt_text,
-        Style::default().fg(Color::DarkGray),
-    ))])
-    .block(Block::default().title("Read-only").borders(Borders::ALL));
+    let wt_style = if wt_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut wt_lines = vec![Line::from(Span::styled(wt_text, wt_style))];
+    if !wt_hint.is_empty() {
+        wt_lines.push(Line::from(Span::styled(
+            wt_hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let wt_title = if wt_focused {
+        "Worktree (focused)"
+    } else {
+        "Worktree"
+    };
+    let readonly_widget = Paragraph::new(wt_lines).block(
+        Block::default()
+            .title(wt_title)
+            .borders(Borders::ALL)
+            .border_style(focus_style(wt_focused)),
+    );
     frame.render_widget(readonly_widget, readonly);
 }
 
@@ -915,7 +951,7 @@ fn footer_controls(app: &App) -> String {
         }
         View::Archive => "↑/↓ move  U unarchive  Esc back  Q quit".to_string(),
         View::Edit => {
-            "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Enter confirm  Esc back  Q quit"
+            "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Del/D clear worktree  Esc back  Q quit"
                 .to_string()
         }
         View::CreatePrompt => "Type / move cursor  Enter create  Esc cancel".to_string(),
