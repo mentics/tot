@@ -23,6 +23,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Edit => draw_edit(frame, body, app),
         View::CreatePrompt => draw_create_prompt(frame, body, app),
         View::CredentialPrompt => draw_credential_prompt(frame, body, app),
+        View::CredentialFileBroken => draw_credential_file_broken(frame, body, app),
         View::SwitchModules => draw_switch_modules(frame, body, app),
         View::SwitchBranch => draw_switch_branch(frame, body, app),
         View::DirtyWarning => draw_dirty_warning(frame, body, app),
@@ -346,6 +347,51 @@ fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &mut App) {
     ))])
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(bottom, hint_bottom);
+}
+
+fn draw_credential_file_broken(frame: &mut Frame, area: Rect, app: &App) {
+    let path = app
+        .credential_broken_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/tod/credentials/linear_api_key".to_string());
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Credential file cannot be decrypted",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(
+            "The encrypted Linear API key file was written on a different machine \
+             (or is corrupt). Common after recreating a container.",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            path,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Recreate it? You will be asked for a new API key."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Y] Recreate    [N] Cancel",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title("Credential file")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
 }
 
 fn draw_switch_modules(frame: &mut Frame, area: Rect, app: &App) {
@@ -865,6 +911,7 @@ fn footer_controls(app: &App) -> String {
         }
         View::CreatePrompt => "Type / move cursor  Enter create  Esc cancel".to_string(),
         View::CredentialPrompt => "Type / move cursor  Enter save  Esc cancel".to_string(),
+        View::CredentialFileBroken => "Y recreate  N/Esc cancel  Q quit".to_string(),
         View::SwitchModules => {
             "↑/↓ move  Space toggle  Enter confirm  Esc cancel  Q quit".to_string()
         }

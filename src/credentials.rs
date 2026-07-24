@@ -128,17 +128,24 @@ fn decrypt_secret(blob: &[u8]) -> color_eyre::Result<String> {
     String::from_utf8(plaintext).wrap_err("credential plaintext was not UTF-8")
 }
 
-fn load_from_file() -> color_eyre::Result<Option<String>> {
+#[derive(Debug)]
+enum FileLoad {
+    Missing,
+    Found(String),
+    /// File exists but cannot be decrypted (wrong machine, corrupt, bad version).
+    Unreadable,
+}
+
+fn load_from_file() -> color_eyre::Result<FileLoad> {
     let path = linear_api_key_file_path()?;
     if !path.exists() {
-        return Ok(None);
+        return Ok(FileLoad::Missing);
     }
     let blob = fs::read(&path).wrap_err_with(|| format!("reading {}", path.display()))?;
-    let secret = decrypt_secret(&blob)?;
-    if secret.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(secret))
+    match decrypt_secret(&blob) {
+        Ok(secret) if secret.is_empty() => Ok(FileLoad::Missing),
+        Ok(secret) => Ok(FileLoad::Found(secret)),
+        Err(_) => Ok(FileLoad::Unreadable),
     }
 }
 
@@ -174,9 +181,16 @@ fn write_private_file(path: &Path, data: &[u8]) -> color_eyre::Result<()> {
 }
 
 fn delete_file_fallback() {
-    if let Ok(path) = linear_api_key_file_path() {
-        let _ = fs::remove_file(path);
+    let _ = remove_linear_api_key_file();
+}
+
+/// Remove the encrypted Linear API key fallback file if it exists.
+pub fn remove_linear_api_key_file() -> color_eyre::Result<()> {
+    let path = linear_api_key_file_path()?;
+    if path.exists() {
+        fs::remove_file(&path).wrap_err_with(|| format!("removing {}", path.display()))?;
     }
+    Ok(())
 }
 
 fn load_from_keyring() -> color_eyre::Result<Option<String>> {
@@ -207,20 +221,37 @@ fn store_to_keyring(api_key: &str) -> color_eyre::Result<()> {
         .map_err(|err| eyre!("storing Linear API key in keyring: {err}"))
 }
 
+/// Result of trying to load the Linear API key from env / keyring / file.
+#[derive(Debug)]
+pub enum LoadLinearApiKey {
+    Found(String),
+    Missing,
+    /// Encrypted fallback exists but cannot be decrypted (e.g. new machine or corrupt file).
+    UnreadableFile {
+        path: PathBuf,
+    },
+}
+
 /// Load the Linear API key: env → OS keyring → encrypted config file.
-pub fn load_linear_api_key() -> color_eyre::Result<Option<String>> {
+pub fn load_linear_api_key() -> color_eyre::Result<LoadLinearApiKey> {
     if let Ok(key) = std::env::var(ENV_LINEAR_API_KEY) {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
+            return Ok(LoadLinearApiKey::Found(trimmed.to_string()));
         }
     }
 
     if let Some(key) = load_from_keyring()? {
-        return Ok(Some(key));
+        return Ok(LoadLinearApiKey::Found(key));
     }
 
-    load_from_file()
+    match load_from_file()? {
+        FileLoad::Found(key) => Ok(LoadLinearApiKey::Found(key)),
+        FileLoad::Missing => Ok(LoadLinearApiKey::Missing),
+        FileLoad::Unreadable => Ok(LoadLinearApiKey::UnreadableFile {
+            path: linear_api_key_file_path()?,
+        }),
+    }
 }
 
 /// Store the Linear API key in the OS keyring, or encrypted file if keyring fails.

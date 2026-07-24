@@ -42,6 +42,8 @@ pub enum View {
     CreatePrompt,
     /// Prompt for Linear API key when missing from the keyring.
     CredentialPrompt,
+    /// Encrypted credential file exists but cannot be decrypted.
+    CredentialFileBroken,
     /// Multiselect modules before leasing a worktree.
     SwitchModules,
     /// Branch name prompt before leasing a worktree.
@@ -295,6 +297,8 @@ pub struct App {
     pub credential_input: TextArea<'static>,
     /// Copy / reason for the credential prompt (missing vs invalid key).
     pub credential_prompt_kind: CredentialPromptKind,
+    /// Path shown when [`View::CredentialFileBroken`] is active.
+    pub credential_broken_path: Option<PathBuf>,
     /// Create input waiting while the user supplies Linear credentials.
     pending_create_input: Option<String>,
     /// After prompts, run lease/activate/cursor on the next loop tick (so the UI can redraw).
@@ -328,6 +332,7 @@ impl App {
             create_input: text_input::single_line(""),
             credential_input: text_input::single_line_masked(""),
             credential_prompt_kind: CredentialPromptKind::Missing,
+            credential_broken_path: None,
             pending_create_input: None,
             pending_finish_switch: None,
             status: None,
@@ -416,6 +421,7 @@ impl App {
             View::Edit => self.handle_edit_key(key)?,
             View::CreatePrompt => self.handle_create_prompt_key(key)?,
             View::CredentialPrompt => self.handle_credential_prompt_key(key)?,
+            View::CredentialFileBroken => self.handle_credential_file_broken_key(key)?,
             View::SwitchModules => self.handle_switch_modules_key(key)?,
             View::SwitchBranch => self.handle_switch_branch_key(key)?,
             View::DirtyWarning => self.handle_dirty_warning_key(terminal, key)?,
@@ -1242,6 +1248,37 @@ impl App {
         Ok(())
     }
 
+    fn handle_credential_file_broken_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let resume = self.pending_create_input.clone().unwrap_or_default();
+                match credentials::remove_linear_api_key_file() {
+                    Ok(()) => {
+                        self.credential_broken_path = None;
+                        self.open_credential_prompt(&resume, CredentialPromptKind::Missing);
+                        self.set_status("Old credential file removed — enter a new Linear API key");
+                    }
+                    Err(err) => {
+                        self.set_error(format!("Could not remove credential file: {err:#}"));
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.credential_broken_path = None;
+                if let Some(input) = self.pending_create_input.take() {
+                    self.create_input = text_input::single_line(&input);
+                    self.view = View::CreatePrompt;
+                } else {
+                    self.view = View::TaskList;
+                }
+                self.set_status("Left credential file unchanged");
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Parse input, optionally fetch Linear issue, persist task, return to list.
     fn submit_create(&mut self, input: &str) -> color_eyre::Result<()> {
         self.submit_create_with_key(input, None)
@@ -1306,13 +1343,18 @@ impl App {
             key.to_string()
         } else {
             match credentials::load_linear_api_key() {
-                Ok(Some(key)) => key,
-                Ok(None) => {
+                Ok(credentials::LoadLinearApiKey::Found(key)) => key,
+                Ok(credentials::LoadLinearApiKey::Missing) => {
                     self.open_credential_prompt(resume_input, CredentialPromptKind::Missing);
                     return Ok(None);
                 }
+                Ok(credentials::LoadLinearApiKey::UnreadableFile { path }) => {
+                    self.open_credential_file_broken(resume_input, path);
+                    return Ok(None);
+                }
                 Err(err) => {
-                    self.set_error(format!("Keyring error: {err:#}"));
+                    // Errors from credentials already name the failing store (keyring vs file).
+                    self.set_error(format!("{err:#}"));
                     self.view = View::CreatePrompt;
                     return Ok(None);
                 }
@@ -1337,6 +1379,7 @@ impl App {
         self.pending_create_input = Some(resume_input.to_string());
         self.credential_input = text_input::single_line_masked("");
         self.credential_prompt_kind = kind;
+        self.credential_broken_path = None;
         self.view = View::CredentialPrompt;
         match kind {
             CredentialPromptKind::Missing => {
@@ -1348,6 +1391,15 @@ impl App {
                 self.set_error("Previous Linear API key looks invalid — enter a new one");
             }
         }
+    }
+
+    fn open_credential_file_broken(&mut self, resume_input: &str, path: PathBuf) {
+        self.pending_create_input = Some(resume_input.to_string());
+        self.credential_broken_path = Some(path);
+        self.view = View::CredentialFileBroken;
+        self.set_error(
+            "Credential file cannot be decrypted (wrong machine or corrupt) — recreate?",
+        );
     }
 
     fn finish_create_task(
