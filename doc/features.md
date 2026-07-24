@@ -162,10 +162,10 @@ if task has no worktree:
     ensure modules + branch (prompt if missing; update the task)
     run New worktree steps
 run Activate worktree steps   # always, including after New worktree
-launch Cursor: cd {worktree path} && cursor .
+launch Cursor: cursor --folder-uri vscode-remote://attached-container+{hex(containerId)}{worktree path}
 ```
 
-Always run `cd {worktree path} && cursor .` as the **last** step, whether or not a Cursor window already exists for that path.
+Always run the attached-container Cursor launch as the **last** step, whether or not a Cursor window already exists for that path.
 
 #### Prerequisites (no worktree yet)
 

@@ -345,22 +345,30 @@ fn run_return(args: &[&str]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Open Cursor on `path` as `cd {path} && cursor .`, without waiting for the
-/// editor window to close.
+/// Open Cursor on `path` via
+/// `cursor --folder-uri vscode-remote://attached-container+{hex(containerId)}{folder}`
+/// so an already-running container is attached (avoids a fresh window that owns
+/// shutdown and kills the container after ~15s).
 ///
 /// Spawns `cursor` as a child process (not a new shell). The child inherits this
-/// process's environment, including `VSCODE_IPC_HOOK_CLI` when present — required
-/// for the remote CLI inside a Cursor/VS Code terminal.
+/// process's environment, including `VSCODE_IPC_HOOK_CLI` when present.
 ///
 /// TEMP: sock-refresh (`newest_vscode_ipc_hook`) stays disabled; we rely on the
 /// inherited hook only.
 pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
     let path = path.as_ref();
-    let display_path = path.display().to_string();
+    let folder = abs_path_string(path)?;
+    let container_id = resolve_container_id().ok_or_else(|| {
+        eyre!(
+            "could not determine Docker/Podman container ID for attached-container URI \
+             (set TOD_CONTAINER_ID to override)"
+        )
+    })?;
+    let uri = attached_container_folder_uri(&container_id, &folder);
+    let display_path = folder.as_str();
 
     let mut cmd = Command::new("cursor");
-    cmd.arg(".")
-        .current_dir(path)
+    cmd.args(["--folder-uri", uri.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -391,6 +399,141 @@ pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
         return Err(eyre!("cursor launch failed for {display_path}: {detail}"));
     }
     Ok(())
+}
+
+fn attached_container_folder_uri(container_id: &str, folder: &str) -> String {
+    format!(
+        "vscode-remote://attached-container+{}{}",
+        utf8_to_hex(container_id),
+        folder
+    )
+}
+
+fn abs_path_string(path: &Path) -> color_eyre::Result<String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .wrap_err("reading cwd to absolutize Cursor path")?
+            .join(path)
+    };
+    let s = abs
+        .to_str()
+        .ok_or_else(|| eyre!("path is not valid UTF-8: {}", abs.display()))?;
+    Ok(s.to_string())
+}
+
+fn utf8_to_hex(s: &str) -> String {
+    let mut hex = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
+}
+
+/// Resolve the current container's ID for `attached-container` URIs.
+///
+/// Order: `TOD_CONTAINER_ID` → `/run/.containerenv` → mountinfo → cgroup →
+/// `/etc/hostname` when it looks like a Docker short/long ID.
+fn resolve_container_id() -> Option<String> {
+    if let Ok(id) = env::var("TOD_CONTAINER_ID") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(id) = container_id_from_containerenv() {
+        return Some(id);
+    }
+    if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
+        if let Some(id) = container_id_from_mountinfo(&mountinfo) {
+            return Some(id);
+        }
+    }
+    if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        if let Some(id) = container_id_from_cgroup(&cgroup) {
+            return Some(id);
+        }
+    }
+    container_id_from_hostname()
+}
+
+fn container_id_from_containerenv() -> Option<String> {
+    let contents = fs::read_to_string("/run/.containerenv").ok()?;
+    for line in contents.lines() {
+        let Some(rest) = line.strip_prefix("id=") else {
+            continue;
+        };
+        let id = rest.trim().trim_matches('"').trim_matches('\'');
+        if looks_like_container_id(id) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn container_id_from_mountinfo(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        for marker in [
+            "/docker/containers/",
+            "/containers/overlay-containers/",
+            "/cri-containerd/",
+        ] {
+            if let Some(rest) = line.split(marker).nth(1) {
+                let id = rest.split('/').next().unwrap_or("");
+                if looks_like_container_id(id) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        // Docker bind of hostname/resolv/hosts: …/<64-hex>/hostname
+        for suffix in ["/hostname", "/resolv.conf", "/hosts"] {
+            if let Some(idx) = line.find(suffix) {
+                let before = &line[..idx];
+                if let Some(slash) = before.rfind('/') {
+                    let id = &before[slash + 1..];
+                    if id.len() == 64 && looks_like_container_id(id) {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn container_id_from_cgroup(contents: &str) -> Option<String> {
+    let mut short: Option<String> = None;
+    for line in contents.lines() {
+        for part in line.split(['/', '-']) {
+            let candidate = part.strip_suffix(".scope").unwrap_or(part);
+            if candidate.len() == 64 && looks_like_container_id(candidate) {
+                return Some(candidate.to_string());
+            }
+            if short.is_none() && candidate.len() == 12 && looks_like_container_id(candidate) {
+                short = Some(candidate.to_string());
+            }
+        }
+    }
+    short
+}
+
+fn container_id_from_hostname() -> Option<String> {
+    let host = fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::var("HOSTNAME").ok().map(|s| s.trim().to_string()))?;
+    if looks_like_container_id(&host) {
+        Some(host)
+    } else {
+        None
+    }
+}
+
+fn looks_like_container_id(s: &str) -> bool {
+    let len = s.len();
+    (len == 12 || len == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Prefer the newest live `vscode-ipc-*.sock` so a long-lived process does not
@@ -551,5 +694,43 @@ mod tests {
     #[test]
     fn ignores_unrelated_lease_errors() {
         assert!(parse_lease_path_conflict_msg("treehouse get failed: pool empty").is_none());
+    }
+
+    #[test]
+    fn hex_encodes_container_id_bytes() {
+        assert_eq!(utf8_to_hex("abc12def3456"), "616263313264656633343536");
+    }
+
+    #[test]
+    fn builds_attached_container_folder_uri() {
+        let id = "7a0144cee125";
+        let folder = "/home/vscode/worktrees/workspace-df5f8e/1/workspace";
+        assert_eq!(
+            attached_container_folder_uri(id, folder),
+            format!(
+                "vscode-remote://attached-container+{}{}",
+                utf8_to_hex(id),
+                folder
+            )
+        );
+    }
+
+    #[test]
+    fn extracts_container_id_from_docker_mountinfo() {
+        let contents = "\
+678 655 254:1 /docker/containers/7a0144cee1256c539fab790199527b7051aff1b603ebcf7ed3fd436440ef3b3a/hostname /etc/hostname rw,relatime - ext4 /dev/vda1 rw\n";
+        assert_eq!(
+            container_id_from_mountinfo(contents).as_deref(),
+            Some("7a0144cee1256c539fab790199527b7051aff1b603ebcf7ed3fd436440ef3b3a")
+        );
+    }
+
+    #[test]
+    fn extracts_container_id_from_cgroup_scope() {
+        let contents = "0::/system.slice/docker-7a0144cee1256c539fab790199527b7051aff1b603ebcf7ed3fd436440ef3b3a.scope\n";
+        assert_eq!(
+            container_id_from_cgroup(contents).as_deref(),
+            Some("7a0144cee1256c539fab790199527b7051aff1b603ebcf7ed3fd436440ef3b3a")
+        );
     }
 }
