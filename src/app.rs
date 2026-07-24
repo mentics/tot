@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -98,24 +98,27 @@ impl StaleWorktreeAction {
     pub fn description(self) -> &'static str {
         match self {
             StaleWorktreeAction::Override => {
-                "Unregister this path so Treehouse can create it again \
+                "Unregister this path in the owning repo (main, or the submodule \
+                 from the error path) so Treehouse can create it again \
                  (same outcome as `git worktree add -f`), then retry the lease."
             }
             StaleWorktreeAction::Prune => {
-                "Run `git worktree prune` to clear every missing-but-registered \
-                 worktree in this repo, then retry the lease."
+                "Run `git worktree prune` in the repo that owns this path \
+                 (main, or the submodule taken from the error path) to clear \
+                 missing-but-registered worktrees there, then retry the lease."
             }
             StaleWorktreeAction::Remove => {
-                "Run `git worktree remove --force` on this path only to clear \
-                 its registration, then retry the lease."
+                "Run `git worktree remove --force` on this path in the owning repo \
+                 (main, or the submodule from the error path), then retry the lease."
             }
             StaleWorktreeAction::ClearPath => {
-                "Try `git worktree remove --force`, then delete any leftover folder \
+                "In the owning repo (main or submodule from the error path), try \
+                 `git worktree remove --force`, then delete any leftover folder \
                  under `.treehouse`, then retry the lease."
             }
             StaleWorktreeAction::DeleteDirectory => {
                 "Delete the leftover folder on disk (only if it is under `.treehouse`), \
-                 then retry the lease."
+                 then retry the lease. Does not touch git registrations."
             }
             StaleWorktreeAction::Cancel => {
                 "Abort the switch and leave the path / registrations unchanged."
@@ -158,7 +161,10 @@ pub struct StaleWorktreeState {
     /// Task file stem so we can resume after indices shift.
     pub task_stem: String,
     pub problem_path: PathBuf,
+    /// Checkout where `git worktree prune` / `remove` must run (main or submodule).
     pub repo_root: PathBuf,
+    /// Submodule path relative to the main repo, when the conflict is under one.
+    pub submodule_rel: Option<PathBuf>,
     pub kind: treehouse::LeasePathConflictKind,
     pub action_cursor: usize,
 }
@@ -1809,11 +1815,15 @@ impl App {
         kind: treehouse::LeasePathConflictKind,
     ) -> color_eyre::Result<()> {
         let cwd = env::current_dir().wrap_err("reading cwd for worktree path recovery")?;
-        let repo_root = gitutil::repo_toplevel(&cwd)?;
+        let main_root = gitutil::repo_toplevel(&cwd)?;
+        // Submodule worktrees are registered against the submodule checkout, not
+        // the main repo — extract that from the conflict path when present.
+        let owner = treehouse::registration_repo_for_conflict(&main_root, &problem_path)?;
         self.stale_worktree = Some(StaleWorktreeState {
             task_stem: task_stem.to_string(),
             problem_path,
-            repo_root,
+            repo_root: owner.path,
+            submodule_rel: owner.submodule_rel,
             kind,
             action_cursor: 0,
         });
@@ -1864,7 +1874,7 @@ impl App {
     }
 
     fn confirm_stale_worktree_action(&mut self) -> color_eyre::Result<()> {
-        let (action, task_stem, problem_path, repo_root) = {
+        let (action, task_stem, problem_path, repo_root, submodule_rel) = {
             let Some(stale) = self.stale_worktree.as_ref() else {
                 return Ok(());
             };
@@ -1877,6 +1887,7 @@ impl App {
                 stale.task_stem.clone(),
                 stale.problem_path.clone(),
                 stale.repo_root.clone(),
+                stale.submodule_rel.clone(),
             )
         };
 
@@ -1888,7 +1899,11 @@ impl App {
                 match gitutil::worktree_remove_force(&repo_root, &problem_path) {
                     Ok(()) => {
                         self.stale_worktree = None;
-                        self.resume_switch_after_stale_fix(&task_stem, action)?;
+                        self.resume_switch_after_stale_fix(
+                            &task_stem,
+                            action,
+                            submodule_rel.as_deref(),
+                        )?;
                     }
                     Err(err) => {
                         self.set_error(format!(
@@ -1901,7 +1916,11 @@ impl App {
             StaleWorktreeAction::Prune => match gitutil::worktree_prune(&repo_root) {
                 Ok(()) => {
                     self.stale_worktree = None;
-                    self.resume_switch_after_stale_fix(&task_stem, action)?;
+                    self.resume_switch_after_stale_fix(
+                        &task_stem,
+                        action,
+                        submodule_rel.as_deref(),
+                    )?;
                 }
                 Err(err) => {
                     self.set_error(format!("git worktree prune failed: {err:#}"));
@@ -1911,7 +1930,11 @@ impl App {
                 match gitutil::clear_worktree_path(&repo_root, &problem_path) {
                     Ok(()) => {
                         self.stale_worktree = None;
-                        self.resume_switch_after_stale_fix(&task_stem, action)?;
+                        self.resume_switch_after_stale_fix(
+                            &task_stem,
+                            action,
+                            submodule_rel.as_deref(),
+                        )?;
                     }
                     Err(err) => {
                         self.set_error(format!(
@@ -1925,7 +1948,11 @@ impl App {
                 match gitutil::remove_treehouse_pool_dir(&problem_path) {
                     Ok(()) => {
                         self.stale_worktree = None;
-                        self.resume_switch_after_stale_fix(&task_stem, action)?;
+                        self.resume_switch_after_stale_fix(
+                            &task_stem,
+                            action,
+                            submodule_rel.as_deref(),
+                        )?;
                     }
                     Err(err) => {
                         self.set_error(format!(
@@ -1943,18 +1970,28 @@ impl App {
         &mut self,
         task_stem: &str,
         action: StaleWorktreeAction,
+        submodule_rel: Option<&Path>,
     ) -> color_eyre::Result<()> {
         let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem) else {
             self.view = View::TaskList;
             self.set_error("Task disappeared while recovering worktree path conflict");
             return Ok(());
         };
+        let scope = submodule_rel
+            .map(|p| format!(" in submodule `{}`", p.display()))
+            .unwrap_or_default();
         let label = match action {
-            StaleWorktreeAction::Override => "Cleared stale registration (override)",
-            StaleWorktreeAction::Prune => "Pruned missing worktree registrations",
-            StaleWorktreeAction::Remove => "Removed worktree registration",
-            StaleWorktreeAction::ClearPath => "Cleared blocking worktree path",
-            StaleWorktreeAction::DeleteDirectory => "Deleted leftover worktree directory",
+            StaleWorktreeAction::Override => {
+                format!("Cleared stale registration (override){scope}")
+            }
+            StaleWorktreeAction::Prune => {
+                format!("Pruned missing worktree registrations{scope}")
+            }
+            StaleWorktreeAction::Remove => format!("Removed worktree registration{scope}"),
+            StaleWorktreeAction::ClearPath => format!("Cleared blocking worktree path{scope}"),
+            StaleWorktreeAction::DeleteDirectory => {
+                format!("Deleted leftover worktree directory{scope}")
+            }
             StaleWorktreeAction::Cancel => unreachable!(),
         };
         self.set_busy(format!("{label}; retrying lease…"));

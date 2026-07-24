@@ -637,9 +637,18 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
             format!("Repo: {}", stale.repo_root.display()),
             Style::default().fg(Color::DarkGray),
         )),
+    ];
+    let mut report_lines = report_lines;
+    if let Some(sub) = stale.submodule_rel.as_ref() {
+        report_lines.push(Line::from(Span::styled(
+            format!("Submodule: {}", sub.display()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    report_lines.extend([
         Line::from(""),
         Line::from("Choose how to clear it, then tod will retry the lease."),
-    ];
+    ]);
 
     let action_items: Vec<ListItem> = actions
         .iter()

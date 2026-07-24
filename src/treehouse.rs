@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use color_eyre::eyre::{Context, eyre};
 use serde::Deserialize;
 
+use crate::gitutil;
 use crate::task::Worktree;
 
 /// Result of `treehouse get --lease`.
@@ -248,14 +249,107 @@ pub fn worktree_number_from_path(path: &Path) -> Option<i32> {
 
 /// Resolve a Treehouse main worktree from a main or submodule path under the pool.
 ///
-/// Accepts `.../<N>/<reponame>` or `.../<N>/<reponame>/<module>`.
+/// Accepts `.../<N>/<reponame>`, `.../<N>/<reponame>/<module>`, or deeper nested
+/// submodule paths (`.../<N>/<reponame>/<a>/<b>`).
 pub fn main_worktree_from_pool_path(path: &Path) -> Option<(i32, PathBuf)> {
-    if let Some(n) = worktree_number_from_path(path) {
-        return Some((n, path.to_path_buf()));
+    let mut current = path;
+    loop {
+        if let Some(n) = worktree_number_from_path(current) {
+            return Some((n, current.to_path_buf()));
+        }
+        current = current.parent()?;
     }
-    let parent = path.parent()?;
-    let n = worktree_number_from_path(parent)?;
-    Some((n, parent.to_path_buf()))
+}
+
+/// Where to run `git worktree prune` / `remove` for a lease path conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRepo {
+    /// Checkout that owns the worktree registration (main or a submodule).
+    pub path: PathBuf,
+    /// Submodule path relative to the main repo, when the conflict is under a submodule.
+    pub submodule_rel: Option<PathBuf>,
+}
+
+/// Resolve the git repo that owns worktree registrations for a conflict path.
+///
+/// Treehouse registers main worktrees against the source main repo, and submodule
+/// worktrees against each submodule's backing checkout (`main_root/<submodule_path>`).
+/// Pruning only the main repo leaves submodule stale registrations untouched.
+pub fn registration_repo_for_conflict(
+    main_root: impl AsRef<Path>,
+    problem_path: impl AsRef<Path>,
+) -> color_eyre::Result<RegistrationRepo> {
+    let main_root = main_root.as_ref();
+    let problem_path = problem_path.as_ref();
+
+    let Some((_, main_wt)) = main_worktree_from_pool_path(problem_path) else {
+        return Ok(RegistrationRepo {
+            path: main_root.to_path_buf(),
+            submodule_rel: None,
+        });
+    };
+
+    if problem_path == main_wt {
+        return Ok(RegistrationRepo {
+            path: main_root.to_path_buf(),
+            submodule_rel: None,
+        });
+    }
+
+    let Ok(rel) = problem_path.strip_prefix(&main_wt) else {
+        return Ok(RegistrationRepo {
+            path: main_root.to_path_buf(),
+            submodule_rel: None,
+        });
+    };
+
+    let matched = match_submodule_rel(main_root, rel)?;
+    let Some(sub_rel) = matched else {
+        // Unknown suffix under the main worktree — try treating it as a submodule path.
+        let candidate = main_root.join(rel);
+        if candidate.is_dir() && gitutil::repo_toplevel(&candidate).is_ok() {
+            return Ok(RegistrationRepo {
+                path: candidate,
+                submodule_rel: Some(rel.to_path_buf()),
+            });
+        }
+        return Ok(RegistrationRepo {
+            path: main_root.to_path_buf(),
+            submodule_rel: None,
+        });
+    };
+
+    let owner = main_root.join(&sub_rel);
+    if !owner.is_dir() {
+        return Err(eyre!(
+            "submodule `{sub}` checkout missing at {} — cannot clear its worktree registrations \
+             (is the submodule initialized in the main repo?)",
+            owner.display(),
+            sub = sub_rel.display()
+        ));
+    }
+    Ok(RegistrationRepo {
+        path: owner,
+        submodule_rel: Some(sub_rel),
+    })
+}
+
+/// Match `rel` (under a main worktree) to a `.gitmodules` submodule path.
+/// Prefers the longest matching submodule path prefix.
+fn match_submodule_rel(main_root: &Path, rel: &Path) -> color_eyre::Result<Option<PathBuf>> {
+    let entries = gitutil::submodule_entries(main_root)?;
+    let mut best: Option<PathBuf> = None;
+    let mut best_len = 0usize;
+    for (_name, sub_rel) in entries {
+        if rel == sub_rel.as_path() || rel.starts_with(&sub_rel) {
+            let len = sub_rel.components().count();
+            if len > best_len {
+                best_len = len;
+                best = Some(sub_rel);
+            }
+        }
+    }
+    Ok(best)
 }
 
 fn status_number_for_path(path: &Path) -> color_eyre::Result<Option<i32>> {
@@ -689,6 +783,100 @@ mod tests {
             path,
             PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/3/workspace")
         );
+    }
+
+    #[test]
+    fn derives_main_worktree_from_nested_submodule_pool_path() {
+        let (n, path) = main_worktree_from_pool_path(Path::new(
+            "/home/vscode/.treehouse/workspace-df5f8e/2/workspace/libs/foo",
+        ))
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/2/workspace")
+        );
+    }
+
+    #[test]
+    fn registration_repo_main_path_uses_main_root() {
+        let main = PathBuf::from("/src/workspace");
+        let problem = PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace");
+        let owner = registration_repo_for_conflict(&main, &problem).unwrap();
+        assert_eq!(owner.path, main);
+        assert!(owner.submodule_rel.is_none());
+    }
+
+    #[test]
+    fn registration_repo_submodule_path_uses_submodule_checkout() {
+        let dir = std::env::temp_dir().join(format!(
+            "tod-reg-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("flagship")).unwrap();
+        fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"flagship\"]\n\tpath = flagship\n\turl = ../flagship.git\n",
+        )
+        .unwrap();
+
+        let problem =
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace/flagship");
+        let owner = registration_repo_for_conflict(&dir, &problem).unwrap();
+        assert_eq!(owner.path, dir.join("flagship"));
+        assert_eq!(owner.submodule_rel.as_deref(), Some(Path::new("flagship")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registration_repo_nested_submodule_prefers_longest_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "tod-reg-repo-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("libs/foo")).unwrap();
+        fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"libs\"]\n\tpath = libs\n\turl = ../libs.git\n\
+             [submodule \"libs/foo\"]\n\tpath = libs/foo\n\turl = ../foo.git\n",
+        )
+        .unwrap();
+
+        let problem =
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/2/workspace/libs/foo");
+        let owner = registration_repo_for_conflict(&dir, &problem).unwrap();
+        assert_eq!(owner.path, dir.join("libs/foo"));
+        assert_eq!(owner.submodule_rel.as_deref(), Some(Path::new("libs/foo")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_stale_submodule_registered_worktree_error() {
+        let msg = "treehouse get --lease --submodules --json failed: \
+             🌳 Preparing submodule worktrees for this pool slot...\n\
+             submodule flagship: git worktree add --detach \
+             /home/vscode/.treehouse/workspace-df5f8e/1/workspace/flagship abcdef: \
+             fatal: '/home/vscode/.treehouse/workspace-df5f8e/1/workspace/flagship' \
+             is a missing but already registered worktree;\n\
+             use 'add -f' to override, or 'prune' or 'remove' to clear";
+        let conflict = parse_lease_path_conflict_msg(msg).unwrap();
+        assert_eq!(
+            conflict.path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace/flagship")
+        );
+        assert_eq!(conflict.kind, LeasePathConflictKind::MissingButRegistered);
     }
 
     #[test]
