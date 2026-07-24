@@ -162,10 +162,10 @@ if task has no worktree:
     ensure modules + branch (prompt if missing; update the task)
     run New worktree steps
 run Activate worktree steps   # always, including after New worktree
-launch Cursor: cursor {worktree path}
+launch Cursor: cd {worktree path} && cursor .
 ```
 
-Always run `cursor {worktree path}` as the **last** step, whether or not a Cursor window already exists for that path.
+Always run `cd {worktree path} && cursor .` as the **last** step, whether or not a Cursor window already exists for that path.
 
 #### Prerequisites (no worktree yet)
 

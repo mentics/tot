@@ -97,7 +97,7 @@ Progress and decisions while implementing `doc/features.md`.
 ### 2026-07-23 — Workflows — Switch
 
 **Completed**
-- Enter on a task runs full switch: prerequisites → lease (if needed) → activate → `cursor {path}`.
+- Enter on a task runs full switch: prerequisites → lease (if needed) → activate → `cd {path} && cursor .`.
 - Prerequisites UI: `SwitchModules` multiselect (Space/Enter) and `SwitchBranch` text prompt when no worktree yet; persist + touch before continuing.
 - `treehouse` module: `get --lease --submodules --json` (with fallbacks for missing flags / plain path stdout); derive worktree number from `.../<N>/<reponame>`; detached `cursor` spawn.
 - `gitutil` + `switch`: checkout/create task branch on selected modules, `temp{N}` elsewhere (main + each submodule).
