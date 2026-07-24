@@ -685,7 +685,7 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
     let [report_area, actions_area, desc_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(actions_height),
-        Constraint::Length(5),
+        Constraint::Length(8),
     ])
     .areas(area);
 

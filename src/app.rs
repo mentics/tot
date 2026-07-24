@@ -76,9 +76,9 @@ pub enum StaleWorktreeAction {
     Prune,
     /// `git worktree remove --force` on this path, then retry.
     Remove,
-    /// Remove registration if any, delete leftover dir under `.treehouse`, then retry.
+    /// Remove registration if any, then delete the worktree directory on disk.
     ClearPath,
-    /// Delete the leftover directory under `.treehouse`, then retry.
+    /// Delete the worktree directory on disk (`rm -rf` that path).
     DeleteDirectory,
     Cancel,
 }
@@ -89,8 +89,8 @@ impl StaleWorktreeAction {
             StaleWorktreeAction::Override => "Override (force)",
             StaleWorktreeAction::Prune => "Prune",
             StaleWorktreeAction::Remove => "Remove",
-            StaleWorktreeAction::ClearPath => "Clear path",
-            StaleWorktreeAction::DeleteDirectory => "Delete directory",
+            StaleWorktreeAction::ClearPath => "Clear path (deletes dir)",
+            StaleWorktreeAction::DeleteDirectory => "Delete worktree directory",
             StaleWorktreeAction::Cancel => "Cancel",
         }
     }
@@ -100,25 +100,31 @@ impl StaleWorktreeAction {
             StaleWorktreeAction::Override => {
                 "Unregister this path in the owning repo (main, or the submodule \
                  from the error path) so Treehouse can create it again \
-                 (same outcome as `git worktree add -f`), then retry the lease."
+                 (same outcome as `git worktree add -f`). Also deletes the worktree \
+                 directory shown above if it still exists (and its main slot if this \
+                 was a submodule path), then retries the lease."
             }
             StaleWorktreeAction::Prune => {
                 "Run `git worktree prune` in the repo that owns this path \
                  (main, or the submodule taken from the error path) to clear \
-                 missing-but-registered worktrees there, then retry the lease."
+                 missing-but-registered worktrees. Also deletes the worktree \
+                 directory shown above if it still exists (and its main slot if this \
+                 was a submodule path), then retries the lease."
             }
             StaleWorktreeAction::Remove => {
                 "Run `git worktree remove --force` on this path in the owning repo \
-                 (main, or the submodule from the error path), then retry the lease."
+                 (main, or the submodule from the error path). Also deletes the \
+                 worktree directory shown above if it still exists (and its main slot \
+                 if this was a submodule path), then retries the lease."
             }
             StaleWorktreeAction::ClearPath => {
-                "In the owning repo (main or submodule from the error path), try \
-                 `git worktree remove --force`, then delete any leftover folder \
-                 under `.treehouse`, then retry the lease."
+                "Unregister this path with `git worktree remove --force` if needed, \
+                 then permanently delete the worktree directory shown above \
+                 (`rm -rf` on that path), then retry the lease."
             }
             StaleWorktreeAction::DeleteDirectory => {
-                "Delete the leftover folder on disk (only if it is under `.treehouse`), \
-                 then retry the lease. Does not touch git registrations."
+                "Permanently delete the worktree directory shown above (`rm -rf` on \
+                 that path), then retry the lease. Does not change git registrations."
             }
             StaleWorktreeAction::Cancel => {
                 "Abort the switch and leave the path / registrations unchanged."
@@ -309,6 +315,9 @@ pub struct App {
     pending_create_input: Option<String>,
     /// After prompts, run lease/activate/cursor on the next loop tick (so the UI can redraw).
     pending_finish_switch: Option<usize>,
+    /// After fixing a missing-but-registered conflict, the next "already exists"
+    /// lease failure is cleared automatically once (partial lease leftover).
+    lease_auto_clear_already_exists: bool,
     pub status: Option<StatusMessage>,
     /// Index into [`SPINNER_FRAMES`] while a busy status is showing.
     pub spinner_frame: usize,
@@ -341,6 +350,7 @@ impl App {
             credential_broken_path: None,
             pending_create_input: None,
             pending_finish_switch: None,
+            lease_auto_clear_already_exists: false,
             status: None,
             spinner_frame: 0,
             should_quit: false,
@@ -1749,6 +1759,24 @@ impl App {
                 }
                 Err(err) => {
                     if let Some(conflict) = treehouse::parse_lease_path_conflict(&err) {
+                        if conflict.kind == treehouse::LeasePathConflictKind::AlreadyExists
+                            && self.lease_auto_clear_already_exists
+                        {
+                            self.lease_auto_clear_already_exists = false;
+                            match self.auto_clear_lease_path_and_retry(
+                                terminal,
+                                &stem,
+                                conflict.path.clone(),
+                            ) {
+                                Ok(()) => return Ok(()),
+                                Err(clear_err) => {
+                                    // Fall through to the normal recovery UI.
+                                    self.set_status(format!(
+                                        "Auto-clear after prune failed ({clear_err:#}); choose a fix"
+                                    ));
+                                }
+                            }
+                        }
                         match self.open_stale_worktree_recovery(&stem, conflict.path, conflict.kind)
                         {
                             Ok(()) => return Ok(()),
@@ -1761,12 +1789,14 @@ impl App {
                             }
                         }
                     }
+                    self.lease_auto_clear_already_exists = false;
                     self.switch_prep = None;
                     self.view = View::TaskList;
                     self.set_error(format!("Treehouse lease failed: {err:#}"));
                     return Ok(());
                 }
             }
+            self.lease_auto_clear_already_exists = false;
             self.sort_tasks();
         }
 
@@ -1977,7 +2007,18 @@ impl App {
             StaleWorktreeAction::Override | StaleWorktreeAction::Remove => {
                 match gitutil::worktree_remove_force(&repo_root, &problem_path) {
                     Ok(()) => {
+                        if let Err(err) =
+                            gitutil::clear_leftover_pool_dirs_after_registration_fix(&problem_path)
+                        {
+                            self.set_error(format!(
+                                "Cleared registration but could not delete leftover pool dirs \
+                                 at {}: {err:#}",
+                                problem_path.display()
+                            ));
+                            return Ok(());
+                        }
                         self.stale_worktree = None;
+                        self.lease_auto_clear_already_exists = true;
                         self.resume_switch_after_stale_fix(
                             &task_stem,
                             action,
@@ -1994,7 +2035,18 @@ impl App {
             }
             StaleWorktreeAction::Prune => match gitutil::worktree_prune(&repo_root) {
                 Ok(()) => {
+                    if let Err(err) =
+                        gitutil::clear_leftover_pool_dirs_after_registration_fix(&problem_path)
+                    {
+                        self.set_error(format!(
+                            "Pruned registration but could not delete leftover pool dirs \
+                             at {}: {err:#}",
+                            problem_path.display()
+                        ));
+                        return Ok(());
+                    }
                     self.stale_worktree = None;
+                    self.lease_auto_clear_already_exists = true;
                     self.resume_switch_after_stale_fix(
                         &task_stem,
                         action,
@@ -2009,6 +2061,7 @@ impl App {
                 match gitutil::clear_worktree_path(&repo_root, &problem_path) {
                     Ok(()) => {
                         self.stale_worktree = None;
+                        self.lease_auto_clear_already_exists = false;
                         self.resume_switch_after_stale_fix(
                             &task_stem,
                             action,
@@ -2024,9 +2077,10 @@ impl App {
                 }
             }
             StaleWorktreeAction::DeleteDirectory => {
-                match gitutil::remove_treehouse_pool_dir(&problem_path) {
+                match gitutil::remove_worktree_dir(&problem_path) {
                     Ok(()) => {
                         self.stale_worktree = None;
+                        self.lease_auto_clear_already_exists = false;
                         self.resume_switch_after_stale_fix(
                             &task_stem,
                             action,
@@ -2042,6 +2096,43 @@ impl App {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// After a prune/override left a leftover pool dir, clear it and retry the lease once.
+    fn auto_clear_lease_path_and_retry(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        task_stem: &str,
+        problem_path: PathBuf,
+    ) -> color_eyre::Result<()> {
+        let cwd = env::current_dir().wrap_err("reading cwd for auto-clear after prune")?;
+        let main_root = gitutil::repo_toplevel(&cwd)?;
+        let owner = treehouse::registration_repo_for_conflict(&main_root, &problem_path)?;
+        let repo_root = owner.path;
+        let path_for_clear = problem_path.clone();
+        self.run_busy(
+            terminal,
+            format!(
+                "Partial lease leftover at {}; clearing before retry…",
+                problem_path.display()
+            ),
+            move || {
+                gitutil::clear_worktree_path(&repo_root, &path_for_clear)?;
+                // Also drop the main slot if this was a nested leftover.
+                gitutil::clear_leftover_pool_dirs_after_registration_fix(&path_for_clear)?;
+                Ok(())
+            },
+        )?;
+
+        let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem) else {
+            self.view = View::TaskList;
+            self.set_error("Task disappeared while auto-clearing leftover worktree path");
+            return Ok(());
+        };
+        self.set_busy("Cleared leftover worktree path; retrying lease…");
+        self.view = View::TaskList;
+        self.pending_finish_switch = Some(task_idx);
         Ok(())
     }
 
@@ -2081,6 +2172,7 @@ impl App {
 
     fn cancel_stale_worktree_recovery(&mut self) {
         self.stale_worktree = None;
+        self.lease_auto_clear_already_exists = false;
         self.view = View::TaskList;
         self.set_status("Switch cancelled (worktree path left unchanged)");
     }

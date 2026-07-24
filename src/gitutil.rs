@@ -251,27 +251,16 @@ pub fn worktree_remove_force(
     Ok(())
 }
 
-/// True if `path` looks like a Treehouse pool worktree (safe to delete as recovery).
-pub fn is_treehouse_pool_path(path: impl AsRef<Path>) -> bool {
-    path.as_ref()
-        .components()
-        .any(|c| c.as_os_str() == ".treehouse")
-}
-
-/// Delete a leftover Treehouse worktree directory after verifying it is under `.treehouse/`.
-pub fn remove_treehouse_pool_dir(path: impl AsRef<Path>) -> color_eyre::Result<()> {
+/// Delete a worktree directory on disk (`remove_dir_all`). No-op if already gone.
+///
+/// Callers must only pass the conflict / leftover worktree path shown to the user.
+pub fn remove_worktree_dir(path: impl AsRef<Path>) -> color_eyre::Result<()> {
     let path = path.as_ref();
-    if !is_treehouse_pool_path(path) {
-        return Err(eyre!(
-            "refusing to delete {}: not under a `.treehouse` directory",
-            path.display()
-        ));
-    }
     if !path.exists() {
         return Ok(());
     }
     std::fs::remove_dir_all(path)
-        .wrap_err_with(|| format!("failed to delete leftover path {}", path.display()))?;
+        .wrap_err_with(|| format!("failed to delete worktree directory {}", path.display()))?;
     Ok(())
 }
 
@@ -296,9 +285,45 @@ pub fn clear_worktree_path(
         }
     }
     if path.exists() {
-        remove_treehouse_pool_dir(path)?;
+        remove_worktree_dir(path)?;
     }
     Ok(())
+}
+
+/// After clearing a stale registration, delete leftover dirs at `path` (and the main
+/// worktree slot when `path` is a submodule under `.../<N>/<repo>/...`).
+///
+/// Partial Treehouse leases often leave the main worktree on disk after a submodule
+/// registration failure; prune alone then retries into "already exists".
+pub fn clear_leftover_pool_dirs_after_registration_fix(
+    problem_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let path = problem_path.as_ref();
+    if path.exists() {
+        remove_worktree_dir(path)?;
+    }
+    // If this was a submodule path (.../<N>/<repo>/<module>), also clear the main
+    // slot when present so the next lease is not blocked by "already exists".
+    if let Some(main) = pool_main_worktree_dir(path) {
+        if main != path && main.exists() {
+            remove_worktree_dir(&main)?;
+        }
+    }
+    Ok(())
+}
+
+/// Derive `.../<N>/<repo>` from a pool path (main or nested submodule).
+fn pool_main_worktree_dir(path: &Path) -> Option<PathBuf> {
+    // Walk up until parent is numeric (the pool slot number).
+    let mut current = path;
+    loop {
+        let parent = current.parent()?;
+        let name = parent.file_name()?.to_str()?;
+        if name.parse::<u32>().is_ok() {
+            return Some(current.to_path_buf());
+        }
+        current = parent;
+    }
 }
 
 #[cfg(test)]
@@ -384,5 +409,37 @@ mod tests {
             lock.conflicting_path,
             PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/3/workspace/flagship")
         );
+    }
+
+    #[test]
+    fn pool_main_dir_from_submodule_path() {
+        assert_eq!(
+            pool_main_worktree_dir(Path::new(
+                "/home/vscode/worktrees/workspace-df5f8e/1/workspace/flagship"
+            )),
+            Some(PathBuf::from(
+                "/home/vscode/worktrees/workspace-df5f8e/1/workspace"
+            ))
+        );
+        assert_eq!(
+            pool_main_worktree_dir(Path::new(
+                "/home/vscode/.treehouse/workspace-df5f8e/2/workspace"
+            )),
+            Some(PathBuf::from(
+                "/home/vscode/.treehouse/workspace-df5f8e/2/workspace"
+            ))
+        );
+    }
+
+    #[test]
+    fn remove_worktree_dir_deletes_existing_path() {
+        let dir = std::env::temp_dir().join(format!("tod-rm-wt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file"), "x").unwrap();
+        remove_worktree_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        // Missing path is fine.
+        remove_worktree_dir(&dir).unwrap();
     }
 }
