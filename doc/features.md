@@ -244,7 +244,7 @@ Inspect the worktree’s **main repo** and **each submodule** separately for lef
 | Staged | Index changes not committed |
 | Unstaged | Tracked file modifications not staged |
 | Untracked | Untracked files (including ignored? **no** — only non-ignored untracked) |
-| Remote divergence | Branch not in sync with its upstream (e.g. unpushed commits, or ahead/behind). Surface this so the user can push or otherwise reconcile before release |
+| Unpushed commits | Local branch is ahead of its upstream (commits that exist only locally). Being *behind* the remote is fine — those changes are already stored upstream and will not be lost on release |
 
 **Ignore submodule pointer / gitlink changes in the main repo.** Submodules often appear “modified” in the parent because they are on a different branch than the parent expects; that is expected and must **not** trigger the warning. Always look *inside* each submodule (and the main repo’s own non-gitlink changes) for real leftovers.
 
@@ -252,17 +252,17 @@ Inspect the worktree’s **main repo** and **each submodule** separately for lef
 
 If anything is dirty or divergent, show a warning and **do not proceed** until the tree is clean (or the user cancels the whole release/archive).
 
-- Group findings by location (main repo vs each submodule) and by kind (**staged** / **unstaged** / **untracked** / **remote**), so the user can see what is going on.
+- Group findings by location (main repo vs each submodule) and by kind (**staged** / **unstaged** / **untracked** / **unpushed**), so the user can see what is going on.
 - If a group has **10 or fewer** paths, list them.
 - If a group has **more than 10** paths, show a **count** instead of listing every file (e.g. “23 untracked files”).
-- Remote divergence may be summarized in words (ahead/behind counts) rather than a file list.
+- Unpushed commits may be summarized in words (ahead count; behind only shown when the branch has also diverged) rather than a file list.
 
 #### User options on the warning
 
 | Option | Behavior |
 | --- | --- |
 | **Check again** | Re-run the inspection. If clean, proceed with release. If still dirty, show the warning again with the current findings. |
-| **Stash changes** | Offered when stashing would clear the blocking local changes. Run a stash that includes **untracked** files. If there is staged content, **unstage then stash** (make that clear in the UI: staged files are listed as staged before stash). After a successful stash, re-check; if clean (including remote sync), proceed. If remote divergence remains, keep blocking until the user reconciles it (stash does not fix unpushed commits). |
+| **Stash changes** | Offered when stashing would clear the blocking local changes. Run a stash that includes **untracked** files. If there is staged content, **unstage then stash** (make that clear in the UI: staged files are listed as staged before stash). After a successful stash, re-check; if clean (including no unpushed commits), proceed. If unpushed commits remain, keep blocking until the user pushes or otherwise reconciles (stash does not fix unpushed commits). |
 | **Cancel** | Abort release (and therefore abort archive if this check was part of archive). Leave the worktree association unchanged. |
 
 The user may leave the TUI, fix things manually in the worktree, return to the same prompt, and choose **Check again**. Repeat until clean or cancelled.

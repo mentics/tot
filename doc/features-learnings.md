@@ -128,9 +128,9 @@ Progress and decisions while implementing `doc/features.md`.
 - **A** archives; if a worktree is associated, runs the same release path first (`then_archive`); cancel/block aborts archive and leaves the association unchanged.
 - Unarchive left as-is (already correct).
 - `DirtyWarning` view with selectable options (↑/↓ + Enter, shortcuts C/S/X, Esc cancel).
-- Dirty inspection (`dirty` module): main repo + each submodule; staged / unstaged / untracked / remote ahead-behind; parent gitlink changes ignored via `--ignore-submodules=all`.
-- Warning UI groups by location + kind; ≤10 paths listed, else count; remote summarized in words.
-- Stash option when local dirt exists: unstage then `git stash push -u` per dirty location; re-check; remote divergence still blocks.
+- Dirty inspection (`dirty` module): main repo + each submodule; staged / unstaged / untracked / unpushed (ahead only; behind ignored); parent gitlink changes ignored via `--ignore-submodules=all`.
+- Warning UI groups by location + kind; ≤10 paths listed, else count; unpushed summarized in words.
+- Stash option when local dirt exists: unstage then `git stash push -u` per dirty location; re-check; unpushed commits still block.
 - Unit tests for classification, stash, gitlink ignore, formatting (temp git repos).
 
 **Decisions**

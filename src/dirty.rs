@@ -1,8 +1,9 @@
 //! Dirty worktree inspection before releasing a Treehouse lease.
 //!
 //! Inspects the worktree main repo and each submodule separately for staged,
-//! unstaged, untracked, and remote-divergence leftovers. Parent gitlink /
-//! submodule-pointer changes are ignored in the main repo.
+//! unstaged, untracked, and unpushed-commit leftovers (local changes that
+//! could be lost on release). Being behind the remote is ignored. Parent
+//! gitlink / submodule-pointer changes are ignored in the main repo.
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,7 @@ impl DirtyKind {
             DirtyKind::Staged => "staged",
             DirtyKind::Unstaged => "unstaged",
             DirtyKind::Untracked => "untracked",
-            DirtyKind::Remote => "remote",
+            DirtyKind::Remote => "unpushed",
         }
     }
 }
@@ -38,9 +39,9 @@ pub struct DirtyGroup {
     pub kind: DirtyKind,
     /// File paths for staged/unstaged/untracked. Empty for remote.
     pub paths: Vec<String>,
-    /// Only set for [`DirtyKind::Remote`].
+    /// Only set for [`DirtyKind::Remote`] (unpushed local commits).
     pub ahead: usize,
-    /// Only set for [`DirtyKind::Remote`].
+    /// Only set for [`DirtyKind::Remote`]; informational when also diverged.
     pub behind: usize,
 }
 
@@ -147,8 +148,10 @@ pub fn inspect_location(
         groups.push(DirtyGroup::local(location, DirtyKind::Untracked, untracked));
     }
 
+    // Only unpushed local commits can be lost on release. Being behind the
+    // remote is fine — those changes are already stored upstream.
     if let Some((ahead, behind)) = remote_divergence(repo)?
-        && (ahead > 0 || behind > 0)
+        && ahead > 0
     {
         groups.push(DirtyGroup::remote(location, ahead, behind));
     }
@@ -309,7 +312,7 @@ pub fn format_report_lines(report: &DirtyReport) -> Vec<String> {
         match group.kind {
             DirtyKind::Remote => {
                 lines.push(format!(
-                    "  remote: {}",
+                    "  unpushed: {}",
                     format_ahead_behind(group.ahead, group.behind)
                 ));
             }
@@ -610,5 +613,147 @@ mod tests {
         assert_eq!(format_ahead_behind(2, 0), "ahead by 2");
         assert_eq!(format_ahead_behind(0, 3), "behind by 3");
         assert_eq!(format_ahead_behind(1, 4), "ahead by 1, behind by 4");
+    }
+
+    /// Clone `origin` into `clone`, set upstream tracking on main.
+    fn clone_with_upstream(origin: &Path, clone: &Path) {
+        assert!(
+            Command::new("git")
+                .args([
+                    "clone",
+                    &origin.display().to_string(),
+                    &clone.display().to_string()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn init_bare_origin(tag: &str) -> (PathBuf, PathBuf) {
+        let seed = temp_dir(&format!("{tag}-seed"));
+        let origin = temp_dir(&format!("{tag}-origin"));
+        init_repo(&seed);
+        assert!(
+            Command::new("git")
+                .args([
+                    "clone",
+                    "--bare",
+                    &seed.display().to_string(),
+                    &origin.display().to_string(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = fs::remove_dir_all(&seed);
+        (origin, temp_dir(&format!("{tag}-clone")))
+    }
+
+    #[test]
+    fn behind_remote_alone_is_clean() {
+        let (origin, clone) = init_bare_origin("behind");
+        let remote_work = temp_dir("behind-remote-work");
+        clone_with_upstream(&origin, &remote_work);
+        clone_with_upstream(&origin, &clone);
+
+        // Advance origin via remote_work so clone is behind after fetch.
+        fs::write(remote_work.join("ahead.txt"), "remote").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "ahead.txt"])
+                .current_dir(&remote_work)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "remote commit"])
+                .current_dir(&remote_work)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["push", "origin", "main"])
+                .current_dir(&remote_work)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["fetch", "origin"])
+                .current_dir(&clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let report = inspect_worktree(&clone).unwrap();
+        assert!(
+            report.is_clean(),
+            "behind-only should not block release, got {report:?}"
+        );
+
+        let _ = fs::remove_dir_all(&origin);
+        let _ = fs::remove_dir_all(&clone);
+        let _ = fs::remove_dir_all(&remote_work);
+    }
+
+    #[test]
+    fn unpushed_commits_block_release() {
+        let (origin, clone) = init_bare_origin("ahead");
+        clone_with_upstream(&origin, &clone);
+
+        fs::write(clone.join("local.txt"), "local").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "local.txt"])
+                .current_dir(&clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "local only"])
+                .current_dir(&clone)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let report = inspect_worktree(&clone).unwrap();
+        assert!(report.has_remote_divergence());
+        assert!(!report.has_local_changes());
+        let remote = report
+            .groups
+            .iter()
+            .find(|g| g.kind == DirtyKind::Remote)
+            .unwrap();
+        assert_eq!(remote.ahead, 1);
+        assert_eq!(remote.behind, 0);
+
+        let _ = fs::remove_dir_all(&origin);
+        let _ = fs::remove_dir_all(&clone);
     }
 }

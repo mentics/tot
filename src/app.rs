@@ -2188,7 +2188,7 @@ impl App {
                     self.complete_release(terminal, task_idx, then_archive)?;
                 } else {
                     let msg = if report.has_remote_divergence() && !report.has_local_changes() {
-                        "Stashed local changes; remote divergence still blocks release".to_string()
+                        "Stashed local changes; unpushed commits still block release".to_string()
                     } else {
                         "Stashed; still dirty — check again after fixing".to_string()
                     };
