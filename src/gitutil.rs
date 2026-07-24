@@ -231,6 +231,41 @@ pub fn worktree_prune(repo: impl AsRef<Path>) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// `git worktree prune` in every submodule checkout, then the main repo.
+///
+/// Treehouse registers submodule worktrees against each submodule's backing
+/// checkout — pruning only the main repo leaves those stale and the next lease
+/// fails on another module.
+pub fn worktree_prune_all(main_root: impl AsRef<Path>) -> color_eyre::Result<()> {
+    let main_root = main_root.as_ref();
+    let mut errors = Vec::new();
+
+    for (name, rel) in submodule_entries(main_root)? {
+        let checkout = main_root.join(&rel);
+        if !checkout.is_dir() {
+            continue;
+        }
+        if let Err(err) = worktree_prune(&checkout) {
+            errors.push(format!(
+                "submodule `{name}` ({}): {err:#}",
+                checkout.display()
+            ));
+        }
+    }
+
+    if let Err(err) = worktree_prune(main_root) {
+        errors.push(format!("main ({}): {err:#}", main_root.display()));
+    }
+
+    if !errors.is_empty() {
+        return Err(eyre!(
+            "git worktree prune failed in one or more repos:\n{}",
+            errors.join("\n")
+        ));
+    }
+    Ok(())
+}
+
 /// Unregister a worktree path, even if the directory is missing (`git worktree remove --force`).
 pub fn worktree_remove_force(
     repo: impl AsRef<Path>,
@@ -251,6 +286,68 @@ pub fn worktree_remove_force(
     Ok(())
 }
 
+/// True when `git worktree remove` failed because the path is not registered.
+fn is_not_a_worktree_err(err: &color_eyre::Report) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    msg.contains("not a working tree")
+        || msg.contains("is not a valid path")
+        || msg.contains("no such file or directory")
+}
+
+fn worktree_remove_force_if_registered(
+    repo: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    match worktree_remove_force(repo, worktree_path) {
+        Ok(()) => Ok(()),
+        Err(err) if is_not_a_worktree_err(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// `git worktree remove --force` for the pool slot in the main repo and every submodule.
+///
+/// Given a conflict at `.../<N>/<repo>` or `.../<N>/<repo>/<module>`, unregisters
+/// the main worktree path and each `.../<N>/<repo>/<submodule_path>` against the
+/// corresponding backing checkout. Missing registrations are ignored.
+pub fn worktree_remove_slot_everywhere(
+    main_root: impl AsRef<Path>,
+    problem_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let main_root = main_root.as_ref();
+    let problem_path = problem_path.as_ref();
+    let main_wt =
+        pool_main_worktree_dir(problem_path).unwrap_or_else(|| problem_path.to_path_buf());
+
+    let mut errors = Vec::new();
+
+    if let Err(err) = worktree_remove_force_if_registered(main_root, &main_wt) {
+        errors.push(format!("main ({}): {err:#}", main_root.display()));
+    }
+
+    for (name, rel) in submodule_entries(main_root)? {
+        let checkout = main_root.join(&rel);
+        if !checkout.is_dir() {
+            continue;
+        }
+        let child = main_wt.join(&rel);
+        if let Err(err) = worktree_remove_force_if_registered(&checkout, &child) {
+            errors.push(format!(
+                "submodule `{name}` ({}): {err:#}",
+                checkout.display()
+            ));
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(eyre!(
+            "git worktree remove failed in one or more repos:\n{}",
+            errors.join("\n")
+        ));
+    }
+    Ok(())
+}
+
 /// Delete a worktree directory on disk (`remove_dir_all`). No-op if already gone.
 ///
 /// Callers must only pass the conflict / leftover worktree path shown to the user.
@@ -265,6 +362,7 @@ pub fn remove_worktree_dir(path: impl AsRef<Path>) -> color_eyre::Result<()> {
 }
 
 /// Clear a blocking worktree path: try `git worktree remove --force`, then delete leftovers.
+#[allow(dead_code)] // kept for single-repo recovery; slot-wide path uses clear_worktree_slot_everywhere
 pub fn clear_worktree_path(
     repo: impl AsRef<Path>,
     worktree_path: impl AsRef<Path>,
@@ -287,6 +385,18 @@ pub fn clear_worktree_path(
     if path.exists() {
         remove_worktree_dir(path)?;
     }
+    Ok(())
+}
+
+/// Unregister the pool slot in main + all submodules, then delete leftover dirs on disk.
+pub fn clear_worktree_slot_everywhere(
+    main_root: impl AsRef<Path>,
+    problem_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let main_root = main_root.as_ref();
+    let problem_path = problem_path.as_ref();
+    worktree_remove_slot_everywhere(main_root, problem_path)?;
+    clear_leftover_pool_dirs_after_registration_fix(problem_path)?;
     Ok(())
 }
 

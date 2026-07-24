@@ -670,14 +670,17 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Repo: {}", stale.repo_root.display()),
+            format!(
+                "Repo: {} (prune/remove apply to main + all submodules)",
+                stale.repo_root.display()
+            ),
             Style::default().fg(Color::DarkGray),
         )),
     ];
     let mut report_lines = report_lines;
     if let Some(sub) = stale.submodule_rel.as_ref() {
         report_lines.push(Line::from(Span::styled(
-            format!("Submodule: {}", sub.display()),
+            format!("Conflict in submodule: {}", sub.display()),
             Style::default().fg(Color::DarkGray),
         )));
     }
