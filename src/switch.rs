@@ -24,6 +24,10 @@ pub struct BranchLockedError {
 /// Failure from [`activate_worktree`].
 #[derive(Debug)]
 pub enum ActivateError {
+    /// Task association points at a directory that no longer exists.
+    PathMissing {
+        worktree: Worktree,
+    },
     /// Needs user choice: conflicting path exists on disk.
     BranchLocked(BranchLockedError),
     Other(color_eyre::Report),
@@ -32,6 +36,11 @@ pub enum ActivateError {
 impl std::fmt::Display for ActivateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ActivateError::PathMissing { worktree } => write!(
+                f,
+                "worktree path does not exist: {}",
+                worktree.path.display()
+            ),
             ActivateError::BranchLocked(e) => write!(
                 f,
                 "branch `{}` is already used by worktree at {}",
@@ -70,10 +79,9 @@ pub fn activate_worktree(
 
     let root = &worktree.path;
     if !root.is_dir() {
-        return Err(ActivateError::Other(eyre!(
-            "worktree path does not exist: {}",
-            root.display()
-        )));
+        return Err(ActivateError::PathMissing {
+            worktree: worktree.clone(),
+        });
     }
 
     let main_name = gitutil::main_repo_name(root).map_err(ActivateError::Other)?;
@@ -117,6 +125,7 @@ pub fn activate_worktree(
 fn annotate_submodule(err: ActivateError, name: &str) -> ActivateError {
     match err {
         locked @ ActivateError::BranchLocked(_) => locked,
+        missing @ ActivateError::PathMissing { .. } => missing,
         ActivateError::Other(report) => {
             ActivateError::Other(report.wrap_err(format!("activating submodule `{name}`")))
         }
@@ -163,6 +172,21 @@ fn checkout_for_activate(
 pub fn lease_new_worktree(cwd: impl AsRef<Path>) -> color_eyre::Result<Worktree> {
     let leased = treehouse::lease_worktree(cwd.as_ref())?;
     Ok(leased.into())
+}
+
+/// Best-effort cleanup when a task's worktree directory is gone.
+///
+/// Tries Treehouse return (so the pool slot is freed) and forgets the git
+/// worktree registration in the main repo. Failures are ignored — the caller
+/// still clears the task association and can lease a fresh worktree.
+pub fn cleanup_missing_worktree(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    let _ = treehouse::return_worktree(path);
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(main) = gitutil::repo_toplevel(&cwd) {
+            let _ = gitutil::forget_worktree_registration(&main, path);
+        }
+    }
 }
 
 /// Open Cursor on the worktree path (detached; does not wait).
@@ -247,5 +271,21 @@ mod tests {
         assert_eq!(head.trim(), "temp7");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activate_reports_path_missing() {
+        let missing = Worktree {
+            number: 7,
+            path: PathBuf::from("/tmp/tod-definitely-missing-worktree-path"),
+        };
+        let err = activate_worktree(&missing, &[], "feat/x", |_| Ok(())).unwrap_err();
+        match err {
+            ActivateError::PathMissing { worktree } => {
+                assert_eq!(worktree.number, 7);
+                assert_eq!(worktree.path, missing.path);
+            }
+            other => panic!("expected PathMissing, got {other}"),
+        }
     }
 }

@@ -614,6 +614,11 @@ impl App {
             return Ok(());
         };
 
+        // Directory already gone — clear the association without a dirty check.
+        if !path.is_dir() {
+            return self.complete_release(terminal, task_idx, then_archive);
+        }
+
         let path_for_check = path.clone();
         let report =
             match self.run_busy(terminal, "Checking worktree for leftovers…", move || {
@@ -680,7 +685,19 @@ impl App {
         self.release = None;
         self.view = View::TaskList;
 
-        if let Err(err) = self.run_busy(
+        let path_missing = !path.is_dir();
+        if path_missing {
+            // Directory already gone: best-effort return/forget, then clear association.
+            let path_cleanup = path.clone();
+            let _ = self.run_busy(
+                terminal,
+                format!("Worktree {wt_num} missing on disk; clearing association…"),
+                move || {
+                    switch::cleanup_missing_worktree(&path_cleanup);
+                    Ok::<(), color_eyre::Report>(())
+                },
+            );
+        } else if let Err(err) = self.run_busy(
             terminal,
             format!("Releasing worktree {wt_num}…"),
             move || treehouse::return_worktree(&path),
@@ -711,10 +728,18 @@ impl App {
 
         if then_archive {
             self.finish_archive(task_idx)?;
-            self.set_status(format!("Released worktree {wt_num} and archived task"));
+            self.set_status(if path_missing {
+                format!("Cleared missing worktree {wt_num} and archived task")
+            } else {
+                format!("Released worktree {wt_num} and archived task")
+            });
         } else {
             self.select_active_task_by_stem(&stem);
-            self.set_status(format!("Released worktree {wt_num}"));
+            self.set_status(if path_missing {
+                format!("Cleared missing worktree {wt_num}")
+            } else {
+                format!("Released worktree {wt_num}")
+            });
         }
         Ok(())
     }
@@ -1695,6 +1720,19 @@ impl App {
             .map(|t| t.file_stem.clone())
             .ok_or_else(|| color_eyre::eyre::eyre!("switch task missing"))?;
 
+        // Stale association: directory gone — clear and lease a fresh worktree.
+        if let Some(wt) = self.tasks[task_idx].worktree.clone() {
+            if !wt.path.is_dir() {
+                self.clear_missing_worktree_association(terminal, &stem, &wt)?;
+            }
+        }
+
+        let task_idx = self
+            .tasks
+            .iter()
+            .position(|t| t.file_stem == stem)
+            .ok_or_else(|| color_eyre::eyre::eyre!("task disappeared after clearing worktree"))?;
+
         // Lease when no worktree yet.
         if self.tasks[task_idx].worktree.is_none() {
             let cwd = env::current_dir().wrap_err("reading cwd for treehouse lease")?;
@@ -1756,6 +1794,14 @@ impl App {
             self.report_progress(terminal, step)
         }) {
             match err {
+                switch::ActivateError::PathMissing { worktree: missing } => {
+                    // Race / path vanished between lease check and activate.
+                    self.clear_missing_worktree_association(terminal, &stem, &missing)?;
+                    self.set_busy("Worktree missing; leasing a new one…");
+                    self.pending_finish_switch =
+                        self.tasks.iter().position(|t| t.file_stem == stem);
+                    return Ok(());
+                }
                 switch::ActivateError::BranchLocked(locked) => {
                     self.open_branch_locked_recovery(&stem, locked);
                     return Ok(());
@@ -1803,6 +1849,39 @@ impl App {
             None => "Switched to task; opened Cursor".to_string(),
         };
         self.set_status(msg);
+        Ok(())
+    }
+
+    /// Clear a task's worktree association when its directory is gone.
+    fn clear_missing_worktree_association(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        stem: &str,
+        worktree: &crate::task::Worktree,
+    ) -> color_eyre::Result<()> {
+        let path = worktree.path.clone();
+        let wt_num = worktree.number;
+        let _ = self.run_busy(
+            terminal,
+            format!("Worktree {wt_num} missing on disk; clearing association…"),
+            move || {
+                switch::cleanup_missing_worktree(&path);
+                Ok::<(), color_eyre::Report>(())
+            },
+        );
+
+        let task_idx = self
+            .tasks
+            .iter()
+            .position(|t| t.file_stem == stem)
+            .ok_or_else(|| color_eyre::eyre::eyre!("task disappeared while clearing worktree"))?;
+        {
+            let task = &mut self.tasks[task_idx];
+            task.worktree = None;
+            task.touch();
+            persist::save_task(task)?;
+        }
+        self.sort_tasks();
         Ok(())
     }
 
