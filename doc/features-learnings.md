@@ -7,15 +7,36 @@ Progress and decisions while implementing `doc/features.md`.
 | Section | Status |
 | --- | --- |
 | Repository context | done (modules discovery helper) |
-| Data model | done |
-| Persistence | done |
-| Views | done |
+| Data model | done (includes `pr_number`) |
+| Persistence | done (tasks + `settings.json`) |
+| Views | done (includes Settings) |
 | Workflows — Create | done |
+| Workflows — Open issue / Open PR | done |
 | Workflows — Switch | done |
 | Workflows — Archive / Unarchive / Release / Dirty check | done |
 | Integrations & credentials | done |
 
 ## Log
+
+### 2026-07-29 — open issue / PR + settings
+
+**Completed**
+- `Task.pr_number` optional field; editable in Edit view.
+- Settings view + `{config}/settings.json` with issue/PR URL templates (`{issue_id}`, `{namespace}`, `{repository}`, `{pr_number}`).
+- Main list **I** opens issue (prompts for issue ID if missing); **P** opens PR (Linear attachment lookup when PR missing but issue ID present; else prompt); **S** opens settings.
+- Linear `fetch_pr_number_for_issue` via issue attachments; git `origin` parsed for namespace/repo.
+- Browser open via `xdg-open` / `open`.
+
+**Decisions**
+- PR template defaults to GitHub-style URL; issue template starts empty (must be set).
+- Namespace/repository come from git remote at open time, not stored in settings.
+- Credential prompt generalized to resume create or open-PR.
+
+**Follow-ups**
+- Optional: open issue/PR from archive/edit views.
+- Optional: settings for non-`origin` remotes.
+
+**Blockers:** none.
 
 ### 2026-07-23 — kickoff
 

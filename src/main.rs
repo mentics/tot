@@ -5,6 +5,7 @@ mod dirty;
 mod gitutil;
 mod linear;
 mod persist;
+mod settings;
 mod switch;
 mod task;
 mod text_input;

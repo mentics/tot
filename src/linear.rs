@@ -61,6 +61,18 @@ struct IssueConnection {
 struct IssueNode {
     title: String,
     identifier: String,
+    #[serde(default)]
+    attachments: Option<AttachmentConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachmentConnection {
+    nodes: Vec<AttachmentNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachmentNode {
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +106,28 @@ pub fn fetch_issue_by_identifier(
     }
 }
 
+/// Look up a GitHub-style PR number linked to a Linear issue (via attachments).
+///
+/// Returns `Ok(None)` when the issue exists but has no recognizable PR attachment.
+pub fn fetch_pr_number_for_issue(
+    api_key: &str,
+    identifier: &str,
+) -> Result<Option<u64>, IssueLookupError> {
+    let (team_key, number) = parse_identifier(identifier).map_err(IssueLookupError::Other)?;
+
+    match fetch_attachments_via_issue_id(api_key, identifier) {
+        Ok(urls) => Ok(first_pr_number(&urls)),
+        Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
+        Err(err) => match fetch_attachments_via_filter(api_key, &team_key, number) {
+            Ok(urls) => Ok(first_pr_number(&urls)),
+            Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
+            Err(filter_err) => Err(IssueLookupError::Other(eyre!(
+                "Linear PR lookup for {identifier} failed ({err}); filter fallback also failed: {filter_err}"
+            ))),
+        },
+    }
+}
+
 fn parse_identifier(identifier: &str) -> color_eyre::Result<(String, i64)> {
     let Some((team, num)) = identifier.rsplit_once('-') else {
         return Err(eyre!("invalid Linear identifier: {identifier}"));
@@ -118,17 +152,7 @@ fn fetch_via_issue_id(api_key: &str, identifier: &str) -> Result<LinearIssue, Is
         "variables": { "id": identifier },
     });
     let response = graphql_post(api_key, &body)?;
-    if let Some(errors) = response.errors {
-        let msg = errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        if looks_like_auth_graphql(&msg) {
-            return Err(IssueLookupError::Unauthorized);
-        }
-        return Err(IssueLookupError::Other(eyre!("GraphQL errors: {msg}")));
-    }
+    check_graphql_errors(&response)?;
     let issue = response
         .data
         .and_then(|d| d.issue)
@@ -168,17 +192,7 @@ fn fetch_via_filter(
         },
     });
     let response = graphql_post(api_key, &body)?;
-    if let Some(errors) = response.errors {
-        let msg = errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        if looks_like_auth_graphql(&msg) {
-            return Err(IssueLookupError::Unauthorized);
-        }
-        return Err(IssueLookupError::Other(eyre!("GraphQL errors: {msg}")));
-    }
+    check_graphql_errors(&response)?;
     let nodes = response
         .data
         .and_then(|d| d.issues)
@@ -191,6 +205,126 @@ fn fetch_via_filter(
         identifier: issue.identifier,
         title: issue.title,
     })
+}
+
+fn fetch_attachments_via_issue_id(
+    api_key: &str,
+    identifier: &str,
+) -> Result<Vec<String>, IssueLookupError> {
+    let query = r#"
+        query IssueAttachments($id: String!) {
+            issue(id: $id) {
+                title
+                identifier
+                attachments {
+                    nodes {
+                        url
+                    }
+                }
+            }
+        }
+    "#;
+    let body = json!({
+        "query": query,
+        "variables": { "id": identifier },
+    });
+    let response = graphql_post(api_key, &body)?;
+    check_graphql_errors(&response)?;
+    let issue = response
+        .data
+        .and_then(|d| d.issue)
+        .ok_or_else(|| IssueLookupError::Other(eyre!("issue not found")))?;
+    Ok(attachment_urls(&issue))
+}
+
+fn fetch_attachments_via_filter(
+    api_key: &str,
+    team_key: &str,
+    number: i64,
+) -> Result<Vec<String>, IssueLookupError> {
+    let query = r#"
+        query IssueAttachmentsByTeamNumber($teamKey: String!, $number: Float!) {
+            issues(
+                filter: {
+                    number: { eq: $number }
+                    team: { key: { eq: $teamKey } }
+                }
+                first: 1
+            ) {
+                nodes {
+                    title
+                    identifier
+                    attachments {
+                        nodes {
+                            url
+                        }
+                    }
+                }
+            }
+        }
+    "#;
+    let body = json!({
+        "query": query,
+        "variables": {
+            "teamKey": team_key,
+            "number": number as f64,
+        },
+    });
+    let response = graphql_post(api_key, &body)?;
+    check_graphql_errors(&response)?;
+    let nodes = response
+        .data
+        .and_then(|d| d.issues)
+        .map(|c| c.nodes)
+        .unwrap_or_default();
+    let issue = nodes.into_iter().next().ok_or_else(|| {
+        IssueLookupError::Other(eyre!("no issue matched team {team_key} number {number}"))
+    })?;
+    Ok(attachment_urls(&issue))
+}
+
+fn attachment_urls(issue: &IssueNode) -> Vec<String> {
+    issue
+        .attachments
+        .as_ref()
+        .map(|c| {
+            c.nodes
+                .iter()
+                .filter_map(|a| a.url.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn first_pr_number(urls: &[String]) -> Option<u64> {
+    urls.iter().find_map(|url| parse_github_pr_number(url))
+}
+
+/// Extract a PR number from a GitHub pull request URL.
+pub fn parse_github_pr_number(url: &str) -> Option<u64> {
+    let lower = url.to_ascii_lowercase();
+    let idx = lower.find("/pull/")?;
+    let after = &url[idx + "/pull/".len()..];
+    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if num.is_empty() {
+        return None;
+    }
+    num.parse().ok()
+}
+
+fn check_graphql_errors(response: &GraphqlResponse) -> Result<(), IssueLookupError> {
+    if let Some(errors) = &response.errors {
+        let msg = errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if looks_like_auth_graphql(&msg) {
+            return Err(IssueLookupError::Unauthorized);
+        }
+        return Err(IssueLookupError::Other(eyre!("GraphQL errors: {msg}")));
+    }
+    Ok(())
 }
 
 fn looks_like_auth_graphql(message: &str) -> bool {
@@ -247,4 +381,25 @@ fn graphql_post(
         .into_body()
         .read_json::<GraphqlResponse>()
         .map_err(|err| IssueLookupError::Other(eyre!("decoding Linear GraphQL response: {err:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_github_pr_urls() {
+        assert_eq!(
+            parse_github_pr_number("https://github.com/acme/widgets/pull/42"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_github_pr_number("https://github.com/acme/widgets/pull/99/files"),
+            Some(99)
+        );
+        assert_eq!(
+            parse_github_pr_number("https://github.com/acme/widgets/issues/42"),
+            None
+        );
+    }
 }

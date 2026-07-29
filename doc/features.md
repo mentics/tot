@@ -28,6 +28,7 @@ tod always uses the **current working directory** as the main git repository. Av
 | Title | string | Required |
 | Branch | string? | Optional branch name |
 | Issue ID | string? | Optional tracker issue ID (e.g. from Linear) |
+| PR number | integer? | Optional pull request number; may be filled from Linear attachments when opening a PR |
 | Modules | list of string | Required; may be empty. See [Modules](#modules) |
 | Worktree | Worktree? | Optional; tracked automatically (not set in the edit view). See [Worktree](#worktree) |
 | Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
@@ -63,9 +64,9 @@ Tasks (and all associated fields) are persisted as **one JSON file per task**.
 
 | Setting | Behavior |
 | --- | --- |
-| Config directory | From `TOD_DATA_DIR` if set; otherwise `$HOME/.config/tod/` (Linux XDG-style). Task files live under `{config}/tasks/`. |
-| Load | On startup, load all task JSON files from `{config}/tasks/` |
-| Save | Write to disk **immediately** whenever any task data changes |
+| Config directory | From `TOD_DATA_DIR` if set; otherwise `$HOME/.config/tod/` (Linux XDG-style). Task files live under `{config}/tasks/`. Settings live at `{config}/settings.json`. |
+| Load | On startup, load all task JSON files from `{config}/tasks/` and settings from `{config}/settings.json` (defaults if missing) |
+| Save | Write to disk **immediately** whenever any task data or settings change |
 | File names | Normalized, truncated title + random characters (avoids collisions) |
 
 ---
@@ -91,9 +92,12 @@ Each task row shows:
 | ↑ / ↓ | Move selection |
 | Enter | On a task: [switch](#switch-to-a-task). On **Create new task**: [create new task](#create-new-task). |
 | E | Open [Edit view](#3-edit-view) for the selected task |
+| I | [Open issue](#open-issue) for the selected task in the browser |
+| P | [Open PR](#open-pr) for the selected task in the browser |
 | R | [Release worktree](#release-worktree) for the selected task (without archiving) |
 | A | [Archive](#archive-task) the selected task |
 | Shift+A | Open [Archive view](#2-archive-view) |
+| S | Open [Settings view](#4-settings-view) |
 | Q | Quit |
 
 ### 2. Archive view
@@ -116,6 +120,7 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 - title
 - branch
 - issue ID
+- PR number
 - **modules** — multiselect of available modules (main repo name + each submodule name)
 
 **Display only**
@@ -126,8 +131,23 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 | --- | --- |
 | Tab / ↑ / ↓ | Move between fields (and within the modules list) |
 | Space | Toggle the highlighted module on/off |
-| Enter | Confirm the current text field (title / branch / issue ID) |
+| Enter | Confirm the current text field (title / branch / issue ID / PR number) |
 | Esc | Return to the previous view |
+| Q | Quit |
+
+### 4. Settings view
+
+Edit URL templates used when opening issues and PRs. Changes persist immediately to `{config}/settings.json`.
+
+| Setting | Placeholders | Notes |
+| --- | --- | --- |
+| Issue URL template | `{issue_id}` | Required before **I** can open an issue |
+| PR URL template | `{namespace}`, `{repository}`, `{pr_number}` | Default is a GitHub-style URL. Namespace and repository are taken from the git `origin` remote when opening |
+
+| Key | Action |
+| --- | --- |
+| Tab / ↑ / ↓ | Move between fields |
+| Esc | Return to the task list |
 | Q | Quit |
 
 ---
@@ -148,6 +168,26 @@ From the task list: select **Create new task**, press Enter, then enter a single
 3. **Title (default)** — otherwise treat the input as the task title.
 
 The new task is non-archived, gets **last used** set to now, and appears in the main list.
+
+### Open issue
+
+From the task list, press **I** on a task:
+
+1. If the task has no issue ID, prompt for one; store it on the task and continue.
+2. Build a URL from the [settings](#4-settings-view) issue URL template by substituting `{issue_id}`.
+3. Open the URL in the system browser (`xdg-open` / `open`).
+
+If the issue URL template is empty or missing `{issue_id}`, show an error directing the user to Settings.
+
+### Open PR
+
+From the task list, press **P** on a task:
+
+1. If the task already has a **PR number**, skip to step 4.
+2. If there is no PR number but there is an **issue ID**, query Linear for attachments on that issue. If a GitHub PR URL is found (`…/pull/N`), store `N` as the PR number and continue. May prompt for Linear credentials.
+3. If there is still no PR number (no issue ID, or Linear had no linked PR), prompt for a PR number; store it and continue.
+4. Resolve `{namespace}` and `{repository}` from the git `origin` remote of the current repo.
+5. Build a URL from the PR URL template and open it in the system browser.
 
 ### Switch to a task
 

@@ -42,6 +42,72 @@ pub fn main_repo_name(root: impl AsRef<Path>) -> color_eyre::Result<String> {
         .map(|n| n.to_string_lossy().into_owned())
 }
 
+/// `(namespace, repository)` parsed from `origin` remote URL (or any remote).
+///
+/// Accepts common GitHub-style forms:
+/// - `git@host:namespace/repo.git`
+/// - `https://host/namespace/repo.git`
+/// - `ssh://git@host/namespace/repo.git`
+pub fn remote_namespace_and_repo(
+    repo: impl AsRef<Path>,
+    remote: &str,
+) -> color_eyre::Result<(String, String)> {
+    let url = git_stdout(repo.as_ref(), &["remote", "get-url", remote])
+        .wrap_err_with(|| format!("reading git remote `{remote}` URL"))?;
+    parse_remote_namespace_and_repo(url.trim())
+        .wrap_err_with(|| format!("parsing remote `{remote}` URL `{url}`"))
+}
+
+/// Parse `namespace` / `repository` from a git remote URL string.
+pub fn parse_remote_namespace_and_repo(url: &str) -> color_eyre::Result<(String, String)> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(eyre!("empty remote URL"));
+    }
+
+    // SSH scp-like: git@host:namespace/repo[.git]
+    if let Some(rest) = url.split_once(':').and_then(|(left, right)| {
+        if left.contains("://") || right.starts_with('/') {
+            None
+        } else if left.contains('@') || !left.contains('/') {
+            Some(right)
+        } else {
+            None
+        }
+    }) {
+        return split_owner_repo(rest);
+    }
+
+    // https://host/namespace/repo[.git] or ssh://git@host/namespace/repo
+    let path = if let Some(idx) = url.find("://") {
+        let after = &url[idx + 3..];
+        after
+            .split_once('/')
+            .map(|(_, path)| path)
+            .ok_or_else(|| eyre!("remote URL has no path: {url}"))?
+    } else {
+        url
+    };
+
+    split_owner_repo(path)
+}
+
+fn split_owner_repo(path: &str) -> color_eyre::Result<(String, String)> {
+    let path = path.trim_start_matches('/');
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let namespace = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| eyre!("remote URL missing namespace: {path}"))?;
+    let repository = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| eyre!("remote URL missing repository: {path}"))?;
+    Ok((namespace.to_string(), repository.to_string()))
+}
+
 /// Submodule `(name, path)` pairs from `.gitmodules` under `root`.
 pub fn submodule_entries(root: impl AsRef<Path>) -> color_eyre::Result<Vec<(String, PathBuf)>> {
     let root = root.as_ref();
@@ -484,6 +550,22 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    #[test]
+    fn parses_common_remote_urls() {
+        assert_eq!(
+            parse_remote_namespace_and_repo("git@github.com:acme/widgets.git").unwrap(),
+            ("acme".into(), "widgets".into())
+        );
+        assert_eq!(
+            parse_remote_namespace_and_repo("https://github.com/acme/widgets.git").unwrap(),
+            ("acme".into(), "widgets".into())
+        );
+        assert_eq!(
+            parse_remote_namespace_and_repo("ssh://git@github.com/acme/widgets.git").unwrap(),
+            ("acme".into(), "widgets".into())
         );
     }
 

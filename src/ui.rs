@@ -6,10 +6,14 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use tui_textarea::{CursorRenderMode, TextArea};
 
 use crate::app::{
-    App, BranchLockedAction, CredentialPromptKind, EditFocus, StaleWorktreeAction, View,
+    App, BranchLockedAction, CredentialPromptKind, EditFocus, FieldPromptKind, SettingsFocus,
+    StaleWorktreeAction, View,
 };
 use crate::credentials;
 use crate::dirty;
+use crate::settings::{
+    ISSUE_ID_PLACEHOLDER, NAMESPACE_PLACEHOLDER, PR_NUMBER_PLACEHOLDER, REPOSITORY_PLACEHOLDER,
+};
 use crate::treehouse::LeasePathConflictKind;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -21,7 +25,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::TaskList => draw_task_list(frame, body, app),
         View::Archive => draw_archive_list(frame, body, app),
         View::Edit => draw_edit(frame, body, app),
+        View::Settings => draw_settings(frame, body, app),
         View::CreatePrompt => draw_create_prompt(frame, body, app),
+        View::FieldPrompt => draw_field_prompt(frame, body, app),
         View::CredentialPrompt => draw_credential_prompt(frame, body, app),
         View::CredentialFileBroken => draw_credential_file_broken(frame, body, app),
         View::SwitchModules => draw_switch_modules(frame, body, app),
@@ -170,7 +176,15 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let [title_area, branch_area, issue_area, modules, readonly] = Layout::vertical([
+    let [
+        title_area,
+        branch_area,
+        issue_area,
+        pr_area,
+        modules,
+        readonly,
+    ] = Layout::vertical([
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
@@ -187,10 +201,16 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
         "Issue ID",
         focus == EditFocus::IssueId,
     );
+    style_field(
+        &mut edit.pr_input,
+        "PR number",
+        focus == EditFocus::PrNumber,
+    );
 
     frame.render_widget(&edit.title_input, title_area);
     frame.render_widget(&edit.branch_input, branch_area);
     frame.render_widget(&edit.issue_input, issue_area);
+    frame.render_widget(&edit.pr_input, pr_area);
 
     let task = &app.tasks[edit.task_idx];
     let focus_style = |focused: bool| {
@@ -288,6 +308,116 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
             .border_style(focus_style(wt_focused)),
     );
     frame.render_widget(readonly_widget, readonly);
+}
+
+fn draw_settings(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.settings_state.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("Settings unavailable").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+
+    let [hint_area, issue_area, pr_area, help_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let hint = Paragraph::new(vec![
+        Line::from("URL templates for opening issues and pull requests in a browser."),
+        Line::from(Span::styled(
+            "Changes save immediately.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(Block::default().title("Settings").borders(Borders::ALL));
+    frame.render_widget(hint, hint_area);
+
+    let focus = state.focus;
+    style_field(
+        &mut state.issue_input,
+        format!("Issue URL template (use {ISSUE_ID_PLACEHOLDER})"),
+        focus == SettingsFocus::IssueUrlTemplate,
+    );
+    style_field(
+        &mut state.pr_input,
+        format!(
+            "PR URL template (use {NAMESPACE_PLACEHOLDER}, {REPOSITORY_PLACEHOLDER}, {PR_NUMBER_PLACEHOLDER})"
+        ),
+        focus == SettingsFocus::PrUrlTemplate,
+    );
+    frame.render_widget(&state.issue_input, issue_area);
+    frame.render_widget(&state.pr_input, pr_area);
+
+    let help = Paragraph::new(vec![
+        Line::from(format!(
+            "Issue example: https://linear.app/your-workspace/issue/{ISSUE_ID_PLACEHOLDER}"
+        )),
+        Line::from(format!(
+            "PR example: https://github.com/{NAMESPACE_PLACEHOLDER}/{REPOSITORY_PLACEHOLDER}/pull/{PR_NUMBER_PLACEHOLDER}"
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Namespace and repository come from the git origin remote when opening a PR.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(help, help_area);
+}
+
+fn draw_field_prompt(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(prompt) = app.field_prompt.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("Prompt unavailable").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+
+    let (title, hint) = match &prompt.kind {
+        FieldPromptKind::IssueId { .. } => (
+            "Issue ID",
+            "This task has no issue ID. Enter one to open it in the browser:",
+        ),
+        FieldPromptKind::PrNumber { .. } => (
+            "PR number",
+            "Enter the pull request number to open in the browser:",
+        ),
+    };
+
+    let [hint_top, input_area, hint_bottom] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let top = Paragraph::new(vec![Line::from(hint)])
+        .block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_widget(top, hint_top);
+
+    prompt.input.set_block(
+        Block::default()
+            .title("Input")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    prompt
+        .input
+        .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(&prompt.input, input_area);
+
+    let bottom = Paragraph::new(vec![Line::from(Span::styled(
+        "←/→ Home/End  Enter confirm  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(bottom, hint_bottom);
 }
 
 fn draw_create_prompt(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -949,7 +1079,7 @@ fn footer_context(app: &App) -> Option<String> {
 fn footer_controls(app: &App) -> String {
     match app.view {
         View::TaskList => {
-            "↑/↓ move  Enter open  E edit  R release  A archive  Shift+A archive view  Q quit"
+            "↑/↓ move  Enter open  E edit  I issue  P PR  R release  A archive  Shift+A archive  S settings  Q quit"
                 .to_string()
         }
         View::Archive => "↑/↓ move  U unarchive  Esc back  Q quit".to_string(),
@@ -957,7 +1087,9 @@ fn footer_controls(app: &App) -> String {
             "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Del/D clear worktree  Esc back  Q quit"
                 .to_string()
         }
+        View::Settings => "Tab/↑/↓ fields  ←/→ edit  Esc back  Q quit".to_string(),
         View::CreatePrompt => "Type / move cursor  Enter create  Esc cancel".to_string(),
+        View::FieldPrompt => "Type / move cursor  Enter confirm  Esc cancel".to_string(),
         View::CredentialPrompt => "Type / move cursor  Enter save  Esc cancel".to_string(),
         View::CredentialFileBroken => "Y recreate  N/Esc cancel  Q quit".to_string(),
         View::SwitchModules => {

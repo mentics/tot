@@ -18,6 +18,9 @@ pub struct Task {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<String>,
+    /// Pull request number (e.g. GitHub PR #42), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
     #[serde(default)]
     pub modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +44,7 @@ impl Task {
             title: title.into(),
             branch: None,
             issue_id: None,
+            pr_number: None,
             modules: Vec::new(),
             worktree: None,
             last_used: Utc::now(),

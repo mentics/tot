@@ -16,6 +16,7 @@ use crate::dirty::{self, DirtyAction, DirtyReport};
 use crate::gitutil;
 use crate::linear;
 use crate::persist;
+use crate::settings::{self, Settings};
 use crate::switch;
 use crate::task::{self, Task};
 use crate::text_input;
@@ -38,8 +39,12 @@ pub enum View {
     TaskList,
     Archive,
     Edit,
+    /// Edit URL templates (issue / PR).
+    Settings,
     /// Single-line input for create-new-task.
     CreatePrompt,
+    /// Prompt for a missing issue ID or PR number before opening a link.
+    FieldPrompt,
     /// Prompt for Linear API key when missing from the keyring.
     CredentialPrompt,
     /// Encrypted credential file exists but cannot be decrypted.
@@ -54,6 +59,44 @@ pub enum View {
     StaleWorktree,
     /// Branch locked by another worktree during activate.
     BranchLocked,
+}
+
+/// What to resume after the user supplies Linear credentials.
+#[derive(Debug, Clone)]
+enum PendingCredentialAction {
+    /// Re-submit create-prompt text.
+    Create(String),
+    /// Resume opening the PR for this task (by file stem).
+    OpenPr { task_stem: String },
+}
+
+/// Which field the generic single-line prompt is collecting.
+#[derive(Debug, Clone)]
+pub enum FieldPromptKind {
+    /// Missing issue ID before opening the tracker issue.
+    IssueId { task_stem: String },
+    /// Missing PR number before opening the pull request.
+    PrNumber { task_stem: String },
+}
+
+#[derive(Debug)]
+pub struct FieldPromptState {
+    pub kind: FieldPromptKind,
+    pub input: TextArea<'static>,
+}
+
+/// Which control is focused in the settings view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsFocus {
+    IssueUrlTemplate,
+    PrUrlTemplate,
+}
+
+#[derive(Debug)]
+pub struct SettingsState {
+    pub focus: SettingsFocus,
+    pub issue_input: TextArea<'static>,
+    pub pr_input: TextArea<'static>,
 }
 
 /// In-progress release (R alone, or as part of archive).
@@ -251,6 +294,7 @@ pub enum EditFocus {
     Title,
     Branch,
     IssueId,
+    PrNumber,
     Modules,
     /// Associated Treehouse worktree (clearable; not editable).
     Worktree,
@@ -268,6 +312,7 @@ pub struct EditState {
     pub title_input: TextArea<'static>,
     pub branch_input: TextArea<'static>,
     pub issue_input: TextArea<'static>,
+    pub pr_input: TextArea<'static>,
 }
 
 /// In-progress switch prerequisites (modules / branch) for a task without a worktree.
@@ -294,10 +339,13 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 #[derive(Debug)]
 pub struct App {
     pub tasks: Vec<Task>,
+    pub settings: Settings,
     pub view: View,
     pub list_state: ListState,
     pub archive_state: ListState,
     pub edit: Option<EditState>,
+    pub settings_state: Option<SettingsState>,
+    pub field_prompt: Option<FieldPromptState>,
     pub switch_prep: Option<SwitchPrepState>,
     pub release: Option<ReleaseState>,
     pub stale_worktree: Option<StaleWorktreeState>,
@@ -310,8 +358,8 @@ pub struct App {
     pub credential_prompt_kind: CredentialPromptKind,
     /// Path shown when [`View::CredentialFileBroken`] is active.
     pub credential_broken_path: Option<PathBuf>,
-    /// Create input waiting while the user supplies Linear credentials.
-    pending_create_input: Option<String>,
+    /// Action waiting while the user supplies Linear credentials.
+    pending_credential: Option<PendingCredentialAction>,
     /// After prompts, run lease/activate/cursor on the next loop tick (so the UI can redraw).
     pending_finish_switch: Option<usize>,
     /// After fixing a missing-but-registered conflict, the next "already exists"
@@ -326,6 +374,7 @@ pub struct App {
 impl App {
     pub fn new() -> color_eyre::Result<Self> {
         let tasks = persist::load_all_tasks()?;
+        let settings = Settings::load()?;
         let mut list_state = ListState::default();
         // Row 0 is always "Create new task".
         list_state.select(Some(0));
@@ -335,10 +384,13 @@ impl App {
         }
         Ok(Self {
             tasks,
+            settings,
             view: View::TaskList,
             list_state,
             archive_state,
             edit: None,
+            settings_state: None,
+            field_prompt: None,
             switch_prep: None,
             release: None,
             stale_worktree: None,
@@ -347,7 +399,7 @@ impl App {
             credential_input: text_input::single_line_masked(""),
             credential_prompt_kind: CredentialPromptKind::Missing,
             credential_broken_path: None,
-            pending_create_input: None,
+            pending_credential: None,
             pending_finish_switch: None,
             lease_auto_clear_already_exists: false,
             status: None,
@@ -434,7 +486,9 @@ impl App {
             View::TaskList => self.handle_task_list_key(terminal, key)?,
             View::Archive => self.handle_archive_key(key)?,
             View::Edit => self.handle_edit_key(terminal, key)?,
+            View::Settings => self.handle_settings_key(key)?,
             View::CreatePrompt => self.handle_create_prompt_key(key)?,
+            View::FieldPrompt => self.handle_field_prompt_key(key)?,
             View::CredentialPrompt => self.handle_credential_prompt_key(key)?,
             View::CredentialFileBroken => self.handle_credential_file_broken_key(key)?,
             View::SwitchModules => self.handle_switch_modules_key(key)?,
@@ -463,6 +517,9 @@ impl App {
             KeyCode::Char('A') => self.open_archive_view(),
             KeyCode::Char('a') => self.archive_selected(terminal)?,
             KeyCode::Char('e') | KeyCode::Char('E') => self.open_edit_for_list_selection()?,
+            KeyCode::Char('i') | KeyCode::Char('I') => self.open_issue_for_list_selection()?,
+            KeyCode::Char('p') | KeyCode::Char('P') => self.open_pr_for_list_selection()?,
+            KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('r') | KeyCode::Char('R') => self.release_selected(terminal)?,
             KeyCode::Down | KeyCode::Char('j') => self.select_next_list(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_list(),
@@ -866,12 +923,18 @@ impl App {
             }
         };
 
-        let (title_input, branch_input, issue_input) = {
+        let (title_input, branch_input, issue_input, pr_input) = {
             let task = &self.tasks[task_idx];
             (
                 text_input::single_line(&task.title),
                 text_input::single_line(task.branch.as_deref().unwrap_or("")),
                 text_input::single_line(task.issue_id.as_deref().unwrap_or("")),
+                text_input::single_line(
+                    task.pr_number
+                        .map(|n| n.to_string())
+                        .as_deref()
+                        .unwrap_or(""),
+                ),
             )
         };
 
@@ -884,6 +947,7 @@ impl App {
             title_input,
             branch_input,
             issue_input,
+            pr_input,
         });
         self.view = View::Edit;
         self.clear_status();
@@ -1019,7 +1083,12 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId), _) => {
+            (
+                Some(
+                    EditFocus::Title | EditFocus::Branch | EditFocus::IssueId | EditFocus::PrNumber,
+                ),
+                _,
+            ) => {
                 // Fall through to textarea handling below.
             }
             (
@@ -1044,6 +1113,7 @@ impl App {
             EditFocus::Title => edit.title_input.input(input),
             EditFocus::Branch => edit.branch_input.input(input),
             EditFocus::IssueId => edit.issue_input.input(input),
+            EditFocus::PrNumber => edit.pr_input.input(input),
             EditFocus::Modules | EditFocus::Worktree => false,
         };
         if modified {
@@ -1070,7 +1140,8 @@ impl App {
         edit.focus = match edit.focus {
             EditFocus::Title => EditFocus::Branch,
             EditFocus::Branch => EditFocus::IssueId,
-            EditFocus::IssueId => EditFocus::Modules,
+            EditFocus::IssueId => EditFocus::PrNumber,
+            EditFocus::PrNumber => EditFocus::Modules,
             EditFocus::Modules => EditFocus::Worktree,
             EditFocus::Worktree => EditFocus::Title,
         };
@@ -1090,7 +1161,8 @@ impl App {
             EditFocus::Title => EditFocus::Worktree,
             EditFocus::Branch => EditFocus::Title,
             EditFocus::IssueId => EditFocus::Branch,
-            EditFocus::Modules => EditFocus::IssueId,
+            EditFocus::PrNumber => EditFocus::IssueId,
+            EditFocus::Modules => EditFocus::PrNumber,
             EditFocus::Worktree => EditFocus::Modules,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
@@ -1138,7 +1210,7 @@ impl App {
             return Ok(());
         };
         match edit.focus {
-            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId => {
+            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId | EditFocus::PrNumber => {
                 // Text already persisted on each keystroke; Enter advances focus.
                 self.edit_focus_next();
             }
@@ -1206,7 +1278,7 @@ impl App {
 
     /// Copy focused edit textareas into the underlying task and persist.
     fn sync_edit_inputs_to_task(&mut self) -> color_eyre::Result<()> {
-        let (task_idx, title, branch, issue_id) = {
+        let (task_idx, title, branch, issue_id, pr_text) = {
             let Some(edit) = self.edit.as_ref() else {
                 return Ok(());
             };
@@ -1215,8 +1287,25 @@ impl App {
                 text_input::value(&edit.title_input),
                 text_input::value(&edit.branch_input),
                 text_input::value(&edit.issue_input),
+                text_input::value(&edit.pr_input),
             )
         };
+
+        let pr_number = {
+            let trimmed = pr_text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                match trimmed.parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        self.set_error("PR number must be a positive integer");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
         let Some(task) = self.tasks.get_mut(task_idx) else {
             return Ok(());
         };
@@ -1237,6 +1326,7 @@ impl App {
                 Some(issue_id)
             }
         };
+        task.pr_number = pr_number;
         task.touch();
         persist::save_task(task)?;
         self.sort_tasks_preserving_edit(task_idx)?;
@@ -1285,6 +1375,428 @@ impl App {
         Ok(())
     }
 
+    // --- Open issue / PR / settings ----------------------------------------
+
+    fn selected_list_task_idx(&self) -> Option<usize> {
+        let row = self.list_state.selected()?;
+        self.tasks_index_for_list_row(row)
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_state = Some(SettingsState {
+            focus: SettingsFocus::IssueUrlTemplate,
+            issue_input: text_input::single_line(&self.settings.issue_url_template),
+            pr_input: text_input::single_line(&self.settings.pr_url_template),
+        });
+        self.view = View::Settings;
+        self.clear_status();
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        if matches!(key.code, KeyCode::BackTab) {
+            self.settings_focus_prev();
+            return Ok(());
+        }
+
+        let focus = self.settings_state.as_ref().map(|s| s.focus);
+        let input = Input::from(key);
+
+        match (focus, &input) {
+            (_, Input { key: Key::Esc, .. }) => {
+                self.leave_settings();
+                return Ok(());
+            }
+            (
+                _,
+                Input {
+                    key: Key::Tab,
+                    shift: false,
+                    ..
+                },
+            )
+            | (_, Input { key: Key::Down, .. }) => {
+                self.settings_focus_next();
+                return Ok(());
+            }
+            (
+                _,
+                Input {
+                    key: Key::Tab,
+                    shift: true,
+                    ..
+                },
+            )
+            | (_, Input { key: Key::Up, .. }) => {
+                self.settings_focus_prev();
+                return Ok(());
+            }
+            (
+                _,
+                Input {
+                    key: Key::Enter, ..
+                },
+            ) => {
+                self.settings_focus_next();
+                return Ok(());
+            }
+            (
+                _,
+                Input {
+                    key: Key::Char('q' | 'Q'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.should_quit = true;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let Some(state) = self.settings_state.as_mut() else {
+            return Ok(());
+        };
+        let modified = match state.focus {
+            SettingsFocus::IssueUrlTemplate => state.issue_input.input(input),
+            SettingsFocus::PrUrlTemplate => state.pr_input.input(input),
+        };
+        if modified {
+            self.sync_settings_inputs()?;
+        }
+        Ok(())
+    }
+
+    fn settings_focus_next(&mut self) {
+        let Some(state) = self.settings_state.as_mut() else {
+            return;
+        };
+        state.focus = match state.focus {
+            SettingsFocus::IssueUrlTemplate => SettingsFocus::PrUrlTemplate,
+            SettingsFocus::PrUrlTemplate => SettingsFocus::IssueUrlTemplate,
+        };
+    }
+
+    fn settings_focus_prev(&mut self) {
+        self.settings_focus_next();
+    }
+
+    fn leave_settings(&mut self) {
+        self.settings_state = None;
+        self.view = View::TaskList;
+        self.clear_status();
+    }
+
+    fn sync_settings_inputs(&mut self) -> color_eyre::Result<()> {
+        let Some(state) = self.settings_state.as_ref() else {
+            return Ok(());
+        };
+        self.settings.issue_url_template = text_input::value(&state.issue_input);
+        self.settings.pr_url_template = text_input::value(&state.pr_input);
+        self.settings.save()?;
+        Ok(())
+    }
+
+    fn open_issue_for_list_selection(&mut self) -> color_eyre::Result<()> {
+        let Some(task_idx) = self.selected_list_task_idx() else {
+            self.set_error("Select a task to open its issue");
+            return Ok(());
+        };
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        match task.issue_id.clone() {
+            Some(id) => self.open_issue_url(&id)?,
+            None => {
+                let stem = task.file_stem.clone();
+                self.open_field_prompt(FieldPromptKind::IssueId { task_stem: stem });
+            }
+        }
+        Ok(())
+    }
+
+    fn open_pr_for_list_selection(&mut self) -> color_eyre::Result<()> {
+        let Some(task_idx) = self.selected_list_task_idx() else {
+            self.set_error("Select a task to open its PR");
+            return Ok(());
+        };
+        self.open_pr_for_task_idx(task_idx, None)
+    }
+
+    fn resume_open_pr_after_credentials(
+        &mut self,
+        task_stem: &str,
+        api_key: Option<&str>,
+    ) -> color_eyre::Result<()> {
+        let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem) else {
+            self.view = View::TaskList;
+            self.set_error("Task no longer available");
+            return Ok(());
+        };
+        self.open_pr_for_task_idx(task_idx, api_key)
+    }
+
+    fn open_pr_for_task_idx(
+        &mut self,
+        task_idx: usize,
+        api_key_override: Option<&str>,
+    ) -> color_eyre::Result<()> {
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        if let Some(pr) = task.pr_number {
+            return self.open_pr_url(pr);
+        }
+
+        let issue_id = task.issue_id.clone();
+        let stem = task.file_stem.clone();
+
+        if let Some(issue_id) = issue_id {
+            match self.lookup_pr_from_linear(&issue_id, &stem, api_key_override)? {
+                Some(pr) => {
+                    if let Some(task) = self.tasks.get_mut(task_idx) {
+                        task.pr_number = Some(pr);
+                        task.touch();
+                        persist::save_task(task)?;
+                    }
+                    self.open_pr_url(pr)?;
+                    return Ok(());
+                }
+                None => {
+                    // Credential prompt opened, or lookup failed / no PR found
+                    // (prompt or error already set).
+                    return Ok(());
+                }
+            }
+        }
+
+        self.open_field_prompt(FieldPromptKind::PrNumber { task_stem: stem });
+        Ok(())
+    }
+
+    /// Returns `Some(pr)` when found, `None` when prompting for credentials or giving up
+    /// (caller should not open a second prompt if credentials were requested).
+    fn lookup_pr_from_linear(
+        &mut self,
+        issue_id: &str,
+        task_stem: &str,
+        api_key_override: Option<&str>,
+    ) -> color_eyre::Result<Option<u64>> {
+        let api_key = if let Some(key) = api_key_override {
+            key.to_string()
+        } else {
+            match credentials::load_linear_api_key() {
+                Ok(credentials::LoadLinearApiKey::Found(key)) => key,
+                Ok(credentials::LoadLinearApiKey::Missing) => {
+                    self.open_credential_prompt_for(
+                        PendingCredentialAction::OpenPr {
+                            task_stem: task_stem.to_string(),
+                        },
+                        CredentialPromptKind::Missing,
+                    );
+                    return Ok(None);
+                }
+                Ok(credentials::LoadLinearApiKey::UnreadableFile { path }) => {
+                    self.open_credential_file_broken(
+                        PendingCredentialAction::OpenPr {
+                            task_stem: task_stem.to_string(),
+                        },
+                        path,
+                    );
+                    return Ok(None);
+                }
+                Err(err) => {
+                    self.set_error(format!("{err:#}"));
+                    self.view = View::TaskList;
+                    return Ok(None);
+                }
+            }
+        };
+
+        match linear::fetch_pr_number_for_issue(&api_key, issue_id) {
+            Ok(Some(pr)) => Ok(Some(pr)),
+            Ok(None) => {
+                self.set_status(format!(
+                    "No PR linked on Linear for {issue_id} — enter PR number"
+                ));
+                self.open_field_prompt(FieldPromptKind::PrNumber {
+                    task_stem: task_stem.to_string(),
+                });
+                Ok(None)
+            }
+            Err(linear::IssueLookupError::Unauthorized) => {
+                self.open_credential_prompt_for(
+                    PendingCredentialAction::OpenPr {
+                        task_stem: task_stem.to_string(),
+                    },
+                    CredentialPromptKind::Invalid,
+                );
+                Ok(None)
+            }
+            Err(linear::IssueLookupError::Other(err)) => {
+                self.set_error(format!("Linear PR lookup failed: {err:#}"));
+                self.open_field_prompt(FieldPromptKind::PrNumber {
+                    task_stem: task_stem.to_string(),
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    fn open_field_prompt(&mut self, kind: FieldPromptKind) {
+        let hint = match &kind {
+            FieldPromptKind::IssueId { .. } => "Enter issue ID (e.g. ENG-123)",
+            FieldPromptKind::PrNumber { .. } => "Enter PR number",
+        };
+        self.field_prompt = Some(FieldPromptState {
+            kind,
+            input: text_input::single_line(""),
+        });
+        self.view = View::FieldPrompt;
+        self.set_status(hint);
+    }
+
+    fn handle_field_prompt_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
+                self.field_prompt = None;
+                self.view = View::TaskList;
+                self.clear_status();
+            }
+            Input {
+                key: Key::Enter, ..
+            } => {
+                self.submit_field_prompt()?;
+            }
+            Input {
+                key: Key::Char('m'),
+                ctrl: true,
+                ..
+            } => {}
+            input => {
+                if let Some(prompt) = self.field_prompt.as_mut() {
+                    prompt.input.input(input);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_field_prompt(&mut self) -> color_eyre::Result<()> {
+        let Some(prompt) = self.field_prompt.as_ref() else {
+            return Ok(());
+        };
+        let value = text_input::value(&prompt.input);
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            self.set_error("Value cannot be empty");
+            return Ok(());
+        }
+        let kind = prompt.kind.clone();
+        self.field_prompt = None;
+
+        match kind {
+            FieldPromptKind::IssueId { task_stem } => {
+                let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem)
+                else {
+                    self.view = View::TaskList;
+                    self.set_error("Task no longer available");
+                    return Ok(());
+                };
+                if let Some(task) = self.tasks.get_mut(task_idx) {
+                    task.issue_id = Some(trimmed.clone());
+                    task.touch();
+                    persist::save_task(task)?;
+                }
+                self.view = View::TaskList;
+                self.open_issue_url(&trimmed)?;
+            }
+            FieldPromptKind::PrNumber { task_stem } => {
+                let pr: u64 = match trimmed.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        self.open_field_prompt(FieldPromptKind::PrNumber { task_stem });
+                        self.set_error("PR number must be a positive integer");
+                        return Ok(());
+                    }
+                };
+                let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem)
+                else {
+                    self.view = View::TaskList;
+                    self.set_error("Task no longer available");
+                    return Ok(());
+                };
+                if let Some(task) = self.tasks.get_mut(task_idx) {
+                    task.pr_number = Some(pr);
+                    task.touch();
+                    persist::save_task(task)?;
+                }
+                self.view = View::TaskList;
+                self.open_pr_url(pr)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_issue_url(&mut self, issue_id: &str) -> color_eyre::Result<()> {
+        match self.settings.build_issue_url(issue_id) {
+            Ok(url) => match settings::open_in_browser(&url) {
+                Ok(()) => {
+                    self.view = View::TaskList;
+                    self.set_status(format!("Opened issue {issue_id}"));
+                }
+                Err(err) => {
+                    self.view = View::TaskList;
+                    self.set_error(format!("Could not open browser: {err:#}"));
+                }
+            },
+            Err(err) => {
+                self.view = View::TaskList;
+                self.set_error(format!("{err:#}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_pr_url(&mut self, pr_number: u64) -> color_eyre::Result<()> {
+        let (namespace, repository) = match env::current_dir()
+            .map_err(|e| eyre!("{e}"))
+            .and_then(|cwd| gitutil::repo_toplevel(&cwd))
+            .and_then(|root| gitutil::remote_namespace_and_repo(&root, "origin"))
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.view = View::TaskList;
+                self.set_error(format!(
+                    "Could not resolve git remote namespace/repo: {err:#}"
+                ));
+                return Ok(());
+            }
+        };
+
+        match self
+            .settings
+            .build_pr_url(&namespace, &repository, pr_number)
+        {
+            Ok(url) => match settings::open_in_browser(&url) {
+                Ok(()) => {
+                    self.view = View::TaskList;
+                    self.set_status(format!("Opened PR #{pr_number}"));
+                }
+                Err(err) => {
+                    self.view = View::TaskList;
+                    self.set_error(format!("Could not open browser: {err:#}"));
+                }
+            },
+            Err(err) => {
+                self.view = View::TaskList;
+                self.set_error(format!("{err:#}"));
+            }
+        }
+        Ok(())
+    }
+
     // --- Create prompt -----------------------------------------------------
 
     fn handle_create_prompt_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
@@ -1292,7 +1804,7 @@ impl App {
         match input {
             Input { key: Key::Esc, .. } => {
                 self.create_input = text_input::single_line("");
-                self.pending_create_input = None;
+                self.pending_credential = None;
                 self.view = View::TaskList;
                 self.clear_status();
             }
@@ -1319,12 +1831,19 @@ impl App {
         let input = Input::from(key);
         match input {
             Input { key: Key::Esc, .. } => {
+                let pending = self.pending_credential.take();
                 self.credential_input = text_input::single_line_masked("");
-                self.pending_create_input = None;
                 self.credential_prompt_kind = CredentialPromptKind::Missing;
                 self.create_input = text_input::single_line("");
                 self.view = View::TaskList;
-                self.set_status("Create cancelled (no Linear API key)");
+                match pending {
+                    Some(PendingCredentialAction::OpenPr { .. }) => {
+                        self.set_status("Open PR cancelled (no Linear API key)");
+                    }
+                    _ => {
+                        self.set_status("Create cancelled (no Linear API key)");
+                    }
+                }
             }
             Input {
                 key: Key::Enter, ..
@@ -1337,36 +1856,17 @@ impl App {
                 }
                 let store_result = credentials::store_linear_api_key(&key_text);
                 self.credential_input = text_input::single_line_masked("");
-                let pending = self.pending_create_input.take();
+                let pending = self.pending_credential.take();
                 match pending {
-                    Some(input) => {
+                    Some(PendingCredentialAction::Create(input)) => {
                         self.create_input = text_input::single_line("");
                         // Use the key just entered; don't rely on an immediate reload.
                         self.submit_create_with_key(&input, Some(key_text.as_str()))?;
-                        match store_result {
-                            Ok(store) => {
-                                // Prefer location message; keep create status if present by appending.
-                                let where_msg = store.status_message();
-                                if let Some(status) = &mut self.status {
-                                    if !status.is_error {
-                                        status.text = format!("{} — {}", status.text, where_msg);
-                                    } else {
-                                        status.text.push_str(&format!(" — {where_msg}"));
-                                    }
-                                } else {
-                                    self.set_status(where_msg);
-                                }
-                            }
-                            Err(err) => {
-                                let suffix = format!(" (credential store failed: {err:#})");
-                                if let Some(status) = &mut self.status {
-                                    status.text.push_str(&suffix);
-                                    status.is_error = true;
-                                } else {
-                                    self.set_error(format!("Linear API key not persisted{suffix}"));
-                                }
-                            }
-                        }
+                        self.append_credential_store_status(store_result);
+                    }
+                    Some(PendingCredentialAction::OpenPr { task_stem }) => {
+                        self.resume_open_pr_after_credentials(&task_stem, Some(key_text.as_str()))?;
+                        self.append_credential_store_status(store_result);
                     }
                     None => {
                         self.view = View::TaskList;
@@ -1389,14 +1889,56 @@ impl App {
         Ok(())
     }
 
+    fn append_credential_store_status(
+        &mut self,
+        store_result: color_eyre::Result<credentials::CredentialStore>,
+    ) {
+        match store_result {
+            Ok(store) => {
+                let where_msg = store.status_message();
+                if let Some(status) = &mut self.status {
+                    if !status.is_error {
+                        status.text = format!("{} — {}", status.text, where_msg);
+                    } else {
+                        status.text.push_str(&format!(" — {where_msg}"));
+                    }
+                } else {
+                    self.set_status(where_msg);
+                }
+            }
+            Err(err) => {
+                let suffix = format!(" (credential store failed: {err:#})");
+                if let Some(status) = &mut self.status {
+                    status.text.push_str(&suffix);
+                    status.is_error = true;
+                } else {
+                    self.set_error(format!("Linear API key not persisted{suffix}"));
+                }
+            }
+        }
+    }
+
     fn handle_credential_file_broken_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let resume = self.pending_create_input.clone().unwrap_or_default();
+                let pending = self.pending_credential.clone();
                 match credentials::remove_linear_api_key_file() {
                     Ok(()) => {
                         self.credential_broken_path = None;
-                        self.open_credential_prompt(&resume, CredentialPromptKind::Missing);
+                        match pending {
+                            Some(action) => {
+                                self.open_credential_prompt_for(
+                                    action,
+                                    CredentialPromptKind::Missing,
+                                );
+                            }
+                            None => {
+                                self.open_credential_prompt_for(
+                                    PendingCredentialAction::Create(String::new()),
+                                    CredentialPromptKind::Missing,
+                                );
+                            }
+                        }
                         self.set_status("Old credential file removed — enter a new Linear API key");
                     }
                     Err(err) => {
@@ -1406,11 +1948,14 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.credential_broken_path = None;
-                if let Some(input) = self.pending_create_input.take() {
-                    self.create_input = text_input::single_line(&input);
-                    self.view = View::CreatePrompt;
-                } else {
-                    self.view = View::TaskList;
+                match self.pending_credential.take() {
+                    Some(PendingCredentialAction::Create(input)) => {
+                        self.create_input = text_input::single_line(&input);
+                        self.view = View::CreatePrompt;
+                    }
+                    _ => {
+                        self.view = View::TaskList;
+                    }
                 }
                 self.set_status("Left credential file unchanged");
             }
@@ -1486,11 +2031,17 @@ impl App {
             match credentials::load_linear_api_key() {
                 Ok(credentials::LoadLinearApiKey::Found(key)) => key,
                 Ok(credentials::LoadLinearApiKey::Missing) => {
-                    self.open_credential_prompt(resume_input, CredentialPromptKind::Missing);
+                    self.open_credential_prompt_for(
+                        PendingCredentialAction::Create(resume_input.to_string()),
+                        CredentialPromptKind::Missing,
+                    );
                     return Ok(None);
                 }
                 Ok(credentials::LoadLinearApiKey::UnreadableFile { path }) => {
-                    self.open_credential_file_broken(resume_input, path);
+                    self.open_credential_file_broken(
+                        PendingCredentialAction::Create(resume_input.to_string()),
+                        path,
+                    );
                     return Ok(None);
                 }
                 Err(err) => {
@@ -1505,7 +2056,10 @@ impl App {
         match linear::fetch_issue_by_identifier(&api_key, issue_id) {
             Ok(issue) => Ok(Some(issue)),
             Err(linear::IssueLookupError::Unauthorized) => {
-                self.open_credential_prompt(resume_input, CredentialPromptKind::Invalid);
+                self.open_credential_prompt_for(
+                    PendingCredentialAction::Create(resume_input.to_string()),
+                    CredentialPromptKind::Invalid,
+                );
                 Ok(None)
             }
             Err(linear::IssueLookupError::Other(err)) => {
@@ -1516,8 +2070,12 @@ impl App {
         }
     }
 
-    fn open_credential_prompt(&mut self, resume_input: &str, kind: CredentialPromptKind) {
-        self.pending_create_input = Some(resume_input.to_string());
+    fn open_credential_prompt_for(
+        &mut self,
+        action: PendingCredentialAction,
+        kind: CredentialPromptKind,
+    ) {
+        self.pending_credential = Some(action);
         self.credential_input = text_input::single_line_masked("");
         self.credential_prompt_kind = kind;
         self.credential_broken_path = None;
@@ -1534,8 +2092,8 @@ impl App {
         }
     }
 
-    fn open_credential_file_broken(&mut self, resume_input: &str, path: PathBuf) {
-        self.pending_create_input = Some(resume_input.to_string());
+    fn open_credential_file_broken(&mut self, action: PendingCredentialAction, path: PathBuf) {
+        self.pending_credential = Some(action);
         self.credential_broken_path = Some(path);
         self.view = View::CredentialFileBroken;
         self.set_error(
@@ -1562,7 +2120,7 @@ impl App {
         self.select_active_task_by_stem(&stem);
 
         self.create_input = text_input::single_line("");
-        self.pending_create_input = None;
+        self.pending_credential = None;
         self.credential_prompt_kind = CredentialPromptKind::Missing;
         self.view = View::TaskList;
         self.set_status(format!("Created task: {title}"));
