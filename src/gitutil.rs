@@ -160,6 +160,16 @@ pub fn local_branch_exists(repo: impl AsRef<Path>, name: &str) -> color_eyre::Re
     Ok(output.status.success())
 }
 
+/// Current checked-out branch name (`git rev-parse --abbrev-ref HEAD`).
+///
+/// Fast: reads the HEAD symbolic ref only (no working-tree scan like `git status`).
+/// Returns `"HEAD"` when detached.
+pub fn current_branch(repo: impl AsRef<Path>) -> color_eyre::Result<String> {
+    let out = git_stdout(repo.as_ref(), &["rev-parse", "--abbrev-ref", "HEAD"])
+        .wrap_err("reading current branch (rev-parse --abbrev-ref HEAD)")?;
+    Ok(out.trim().to_string())
+}
+
 /// Create `branch` if missing, then check it out in `repo`.
 ///
 /// If checkout fails because the branch is locked by another worktree whose path is
@@ -192,6 +202,11 @@ pub fn checkout_or_create_branch(repo: impl AsRef<Path>, branch: &str) -> color_
 fn checkout_or_create_branch_once(repo: &Path, branch: &str) -> color_eyre::Result<()> {
     if branch.is_empty() {
         return Err(eyre!("branch name is empty"));
+    }
+
+    // Already on the target branch — skip checkout (avoids a no-op `git checkout`).
+    if current_branch(repo).is_ok_and(|head| head == branch) {
+        return Ok(());
     }
 
     if local_branch_exists(repo, branch)? {

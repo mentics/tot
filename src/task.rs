@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -18,9 +19,12 @@ pub struct Task {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<String>,
-    /// Pull request number (e.g. GitHub PR #42), when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr_number: Option<u64>,
+    /// Pull request numbers keyed by module (repository) name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub module_prs: BTreeMap<String, u64>,
+    /// Legacy single PR number from older task files; migrated into [`Self::module_prs`].
+    #[serde(default, rename = "pr_number", skip_serializing)]
+    pub legacy_pr_number: Option<u64>,
     #[serde(default)]
     pub modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,7 +48,8 @@ impl Task {
             title: title.into(),
             branch: None,
             issue_id: None,
-            pr_number: None,
+            module_prs: BTreeMap::new(),
+            legacy_pr_number: None,
             modules: Vec::new(),
             worktree: None,
             last_used: Utc::now(),
@@ -52,9 +57,30 @@ impl Task {
         }
     }
 
+    /// Move a legacy top-level `pr_number` into [`Self::module_prs`] when possible.
+    pub fn migrate_legacy_pr(&mut self) {
+        let Some(pr) = self.legacy_pr_number.take() else {
+            return;
+        };
+        if !self.module_prs.is_empty() {
+            return;
+        }
+        if let Some(module) = self.modules.first() {
+            self.module_prs.insert(module.clone(), pr);
+        }
+    }
+
     /// Update cognitive-recency timestamp to now.
     pub fn touch(&mut self) {
         self.last_used = Utc::now();
+    }
+
+    /// Modules that already have a known PR number.
+    pub fn modules_with_prs(&self) -> Vec<(String, u64)> {
+        self.modules
+            .iter()
+            .filter_map(|m| self.module_prs.get(m).map(|n| (m.clone(), *n)))
+            .collect()
     }
 }
 

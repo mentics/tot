@@ -106,20 +106,28 @@ pub fn fetch_issue_by_identifier(
     }
 }
 
-/// Look up a GitHub-style PR number linked to a Linear issue (via attachments).
+/// A GitHub PR linked to a Linear issue (from attachments).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedPr {
+    /// Repository name segment from the PR URL (e.g. `widgets` in `org/widgets`).
+    pub repository: String,
+    pub number: u64,
+}
+
+/// Look up GitHub-style PRs linked to a Linear issue (via attachments).
 ///
-/// Returns `Ok(None)` when the issue exists but has no recognizable PR attachment.
-pub fn fetch_pr_number_for_issue(
+/// Returns an empty vec when the issue exists but has no recognizable PR attachments.
+pub fn fetch_linked_prs_for_issue(
     api_key: &str,
     identifier: &str,
-) -> Result<Option<u64>, IssueLookupError> {
+) -> Result<Vec<LinkedPr>, IssueLookupError> {
     let (team_key, number) = parse_identifier(identifier).map_err(IssueLookupError::Other)?;
 
     match fetch_attachments_via_issue_id(api_key, identifier) {
-        Ok(urls) => Ok(first_pr_number(&urls)),
+        Ok(urls) => Ok(linked_prs_from_urls(&urls)),
         Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
         Err(err) => match fetch_attachments_via_filter(api_key, &team_key, number) {
-            Ok(urls) => Ok(first_pr_number(&urls)),
+            Ok(urls) => Ok(linked_prs_from_urls(&urls)),
             Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
             Err(filter_err) => Err(IssueLookupError::Other(eyre!(
                 "Linear PR lookup for {identifier} failed ({err}); filter fallback also failed: {filter_err}"
@@ -296,20 +304,29 @@ fn attachment_urls(issue: &IssueNode) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn first_pr_number(urls: &[String]) -> Option<u64> {
-    urls.iter().find_map(|url| parse_github_pr_number(url))
+fn linked_prs_from_urls(urls: &[String]) -> Vec<LinkedPr> {
+    urls.iter().filter_map(|url| parse_github_pr(url)).collect()
 }
 
-/// Extract a PR number from a GitHub pull request URL.
-pub fn parse_github_pr_number(url: &str) -> Option<u64> {
+/// Extract `(repository, pr_number)` from a GitHub pull request URL.
+pub fn parse_github_pr(url: &str) -> Option<LinkedPr> {
+    // .../namespace/repository/pull/123
     let lower = url.to_ascii_lowercase();
     let idx = lower.find("/pull/")?;
+    let before = &url[..idx];
     let after = &url[idx + "/pull/".len()..];
     let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     if num.is_empty() {
         return None;
     }
-    num.parse().ok()
+    let number: u64 = num.parse().ok()?;
+    let repository = before
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some(LinkedPr { repository, number })
 }
 
 fn check_graphql_errors(response: &GraphqlResponse) -> Result<(), IssueLookupError> {
@@ -390,15 +407,21 @@ mod tests {
     #[test]
     fn parses_github_pr_urls() {
         assert_eq!(
-            parse_github_pr_number("https://github.com/acme/widgets/pull/42"),
-            Some(42)
+            parse_github_pr("https://github.com/acme/widgets/pull/42"),
+            Some(LinkedPr {
+                repository: "widgets".into(),
+                number: 42,
+            })
         );
         assert_eq!(
-            parse_github_pr_number("https://github.com/acme/widgets/pull/99/files"),
-            Some(99)
+            parse_github_pr("https://github.com/acme/widgets/pull/99/files"),
+            Some(LinkedPr {
+                repository: "widgets".into(),
+                number: 99,
+            })
         );
         assert_eq!(
-            parse_github_pr_number("https://github.com/acme/widgets/issues/42"),
+            parse_github_pr("https://github.com/acme/widgets/issues/42"),
             None
         );
     }

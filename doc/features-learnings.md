@@ -18,6 +18,29 @@ Progress and decisions while implementing `doc/features.md`.
 
 ## Log
 
+### 2026-07-30 — switch activate fast path
+
+**Completed**
+- Switch skips checkouts when the worktree is already on expected branches (main + submodules).
+- Detection uses `git rev-parse --abbrev-ref HEAD` only (no `git status`); `checkout_or_create_branch` also no-ops when already on the target.
+
+**Decisions**
+- “Already activated” is the gate, not “Cursor window open” (no reliable close notification / path-accurate window list).
+- Any HEAD read failure → treat as not activated and fall through to normal activate.
+
+### 2026-07-30 — per-module PRs
+
+**Completed**
+- Replaced single `pr_number` with `module_prs` map (module name → PR number); legacy `pr_number` migrated on load when possible.
+- `{repository}` in PR URL template is the module name; `{namespace}` still from git `origin`.
+- Edit: PR shown beside each module; Enter/P edits that module’s PR.
+- Open PR: Linear attachments matched by repo name to modules; auto-open when exactly one module has a PR; otherwise module picker.
+- Clearing a module (Space) also clears its PR.
+
+**Decisions**
+- Do not overwrite existing module PR values when Linear fills.
+- One candidate with a known PR → open immediately (no picker).
+
 ### 2026-07-29 — open issue / PR + settings
 
 **Completed**

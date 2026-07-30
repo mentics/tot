@@ -62,6 +62,9 @@ impl From<color_eyre::Report> for ActivateError {
 
 /// Check out the task branch (or `temp{N}`) in the worktree main repo and each submodule.
 ///
+/// If every repo is already on the expected branch (cheap `rev-parse --abbrev-ref HEAD`
+/// checks), checkouts are skipped and Cursor can be opened immediately.
+///
 /// `on_progress` is called with a human-readable step label before each checkout.
 /// Missing conflicting worktree registrations are forgotten automatically inside checkout.
 /// If a conflicting path **exists**, returns [`ActivateError::BranchLocked`].
@@ -92,6 +95,14 @@ pub fn activate_worktree(
     } else {
         temp_branch.as_str()
     };
+
+    // Fast path: already activated — only HEAD refs are read (no `git status`).
+    if worktree_already_on_targets(root, task_modules, branch, &main_name, &temp_branch)? {
+        on_progress("Activate worktree: already on expected branches".into())
+            .map_err(ActivateError::Other)?;
+        return Ok(());
+    }
+
     on_progress(format!(
         "Activate worktree: main `{main_name}` → `{main_target}`"
     ))
@@ -120,6 +131,46 @@ pub fn activate_worktree(
     }
 
     Ok(())
+}
+
+/// True when main + every submodule HEAD already matches the activate targets.
+///
+/// Uses only `git rev-parse --abbrev-ref HEAD` (and a cheap `.gitmodules` read).
+/// Any read failure or missing submodule path means "not activated" so the normal
+/// activate path can surface the real error.
+fn worktree_already_on_targets(
+    root: &Path,
+    task_modules: &[String],
+    branch: &str,
+    main_name: &str,
+    temp_branch: &str,
+) -> Result<bool, ActivateError> {
+    let main_target = if task_modules.iter().any(|m| m == main_name) {
+        branch
+    } else {
+        temp_branch
+    };
+    match gitutil::current_branch(root) {
+        Ok(head) if head == main_target => {}
+        _ => return Ok(false),
+    }
+
+    for (name, rel) in gitutil::submodule_entries(root).map_err(ActivateError::Other)? {
+        let sub_path = root.join(&rel);
+        if !sub_path.is_dir() {
+            return Ok(false);
+        }
+        let target = if task_modules.iter().any(|m| m == &name) {
+            branch
+        } else {
+            temp_branch
+        };
+        match gitutil::current_branch(&sub_path) {
+            Ok(head) if head == target => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 fn annotate_submodule(err: ActivateError, name: &str) -> ActivateError {
@@ -287,5 +338,38 @@ mod tests {
             }
             other => panic!("expected PathMissing, got {other}"),
         }
+    }
+
+    #[test]
+    fn activate_skips_when_already_on_targets() {
+        let dir = std::env::temp_dir().join(format!("tod-switch-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        init_repo(&dir);
+        let main = gitutil::main_repo_name(&dir).unwrap();
+
+        let wt = Worktree {
+            number: 3,
+            path: PathBuf::from(&dir),
+        };
+
+        activate_worktree(&wt, &[main.clone()], "feat/already", |_| Ok(())).unwrap();
+
+        let mut steps = Vec::new();
+        activate_worktree(&wt, &[main], "feat/already", |step| {
+            steps.push(step);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(steps.len(), 1);
+        assert!(
+            steps[0].contains("already on expected branches"),
+            "expected skip message, got {:?}",
+            steps[0]
+        );
+        let head = gitutil::current_branch(&dir).unwrap();
+        assert_eq!(head, "feat/already");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

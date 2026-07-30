@@ -66,6 +66,7 @@ fn load_task_file(path: &Path) -> color_eyre::Result<Task> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| eyre!("task file has no UTF-8 stem: {}", path.display()))?;
     task.file_stem = stem.to_string();
+    task.migrate_legacy_pr();
     Ok(task)
 }
 

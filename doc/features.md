@@ -28,7 +28,7 @@ tod always uses the **current working directory** as the main git repository. Av
 | Title | string | Required |
 | Branch | string? | Optional branch name |
 | Issue ID | string? | Optional tracker issue ID (e.g. from Linear) |
-| PR number | integer? | Optional pull request number; may be filled from Linear attachments when opening a PR |
+| Module PRs | map of string → integer | Optional PR number per associated module (module name = repository in the PR URL template). May be filled from Linear attachments matched by repo name |
 | Modules | list of string | Required; may be empty. See [Modules](#modules) |
 | Worktree | Worktree? | Optional; tracked automatically (not set in the edit view). See [Worktree](#worktree) |
 | Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
@@ -120,8 +120,7 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 - title
 - branch
 - issue ID
-- PR number
-- **modules** — multiselect of available modules (main repo name + each submodule name)
+- **modules** — multiselect of available modules (main repo name + each submodule name); each selected module may have a PR number (Enter / P while focused on the module)
 
 **Display only**
 
@@ -130,8 +129,8 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 | Key | Action |
 | --- | --- |
 | Tab / ↑ / ↓ | Move between fields (and within the modules list) |
-| Space | Toggle the highlighted module on/off |
-| Enter | Confirm the current text field (title / branch / issue ID / PR number) |
+| Enter | Confirm the current text field (title / branch / issue ID). On modules: set/edit that module’s PR number |
+| Space | Toggle the highlighted module on/off (clears that module’s PR when unchecked) |
 | Esc | Return to the previous view |
 | Q | Quit |
 
@@ -142,7 +141,7 @@ Edit URL templates used when opening issues and PRs. Changes persist immediately
 | Setting | Placeholders | Notes |
 | --- | --- | --- |
 | Issue URL template | `{issue_id}` | Required before **I** can open an issue |
-| PR URL template | `{namespace}`, `{repository}`, `{pr_number}` | Default is a GitHub-style URL. Namespace and repository are taken from the git `origin` remote when opening |
+| PR URL template | `{namespace}`, `{repository}`, `{pr_number}` | Default is a GitHub-style URL. `{namespace}` comes from the git `origin` remote; `{repository}` is the **module name** |
 
 | Key | Action |
 | --- | --- |
@@ -183,11 +182,12 @@ If the issue URL template is empty or missing `{issue_id}`, show an error direct
 
 From the task list, press **P** on a task:
 
-1. If the task already has a **PR number**, skip to step 4.
-2. If there is no PR number but there is an **issue ID**, query Linear for attachments on that issue. If a GitHub PR URL is found (`…/pull/N`), store `N` as the PR number and continue. May prompt for Linear credentials.
-3. If there is still no PR number (no issue ID, or Linear had no linked PR), prompt for a PR number; store it and continue.
-4. Resolve `{namespace}` and `{repository}` from the git `origin` remote of the current repo.
-5. Build a URL from the PR URL template and open it in the system browser.
+1. The task must have at least one associated **module**.
+2. For any modules missing a PR number, if the task has an **issue ID**, query Linear attachments. For each GitHub PR URL whose repository segment matches a module name, store that PR number on the module (existing values are not overwritten).
+3. If exactly **one** module has a PR number, open it immediately (no picker).
+4. If **multiple** modules have PR numbers, show a module picker, then open the chosen one.
+5. If **no** module has a PR yet: with one module, prompt for its PR number; with several, pick a module then prompt if needed.
+6. Build the URL with `{namespace}` from git `origin`, `{repository}` = module name, `{pr_number}` = that module’s PR, and open it in the browser.
 
 ### Switch to a task
 
@@ -225,7 +225,9 @@ When the task is **not** yet associated with a worktree. On success, continue wi
 
 When the task **already** has a worktree, and also always after **New worktree**.
 
-Check out a branch in the main repository and in every submodule. Worktrees cannot all share the same branch name, so:
+If main and every submodule are already on the expected branches (checked with `git rev-parse --abbrev-ref HEAD` only — not `git status`), skip checkouts and go straight to launching Cursor.
+
+Otherwise, check out a branch in the main repository and in every submodule. Worktrees cannot all share the same branch name, so:
 
 | Target | Branch to check out |
 | --- | --- |

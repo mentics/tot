@@ -45,6 +45,8 @@ pub enum View {
     CreatePrompt,
     /// Prompt for a missing issue ID or PR number before opening a link.
     FieldPrompt,
+    /// Pick which module's PR to open when more than one applies.
+    ModulePrPicker,
     /// Prompt for Linear API key when missing from the keyring.
     CredentialPrompt,
     /// Encrypted credential file exists but cannot be decrypted.
@@ -75,14 +77,30 @@ enum PendingCredentialAction {
 pub enum FieldPromptKind {
     /// Missing issue ID before opening the tracker issue.
     IssueId { task_stem: String },
-    /// Missing PR number before opening the pull request.
-    PrNumber { task_stem: String },
+    /// Missing / editable PR number for a module.
+    PrNumber {
+        task_stem: String,
+        module: String,
+        /// View to return to on cancel / after save without opening.
+        return_to: View,
+        /// When true, open the PR in the browser after saving.
+        open_after: bool,
+    },
 }
 
 #[derive(Debug)]
 pub struct FieldPromptState {
     pub kind: FieldPromptKind,
     pub input: TextArea<'static>,
+}
+
+/// Pick a module (and its PR) when opening from the task list.
+#[derive(Debug)]
+pub struct ModulePrPickerState {
+    pub task_stem: String,
+    /// `(module, known_pr)` — `None` means the user must enter a number next.
+    pub options: Vec<(String, Option<u64>)>,
+    pub cursor: usize,
 }
 
 /// Which control is focused in the settings view.
@@ -294,7 +312,6 @@ pub enum EditFocus {
     Title,
     Branch,
     IssueId,
-    PrNumber,
     Modules,
     /// Associated Treehouse worktree (clearable; not editable).
     Worktree,
@@ -312,7 +329,6 @@ pub struct EditState {
     pub title_input: TextArea<'static>,
     pub branch_input: TextArea<'static>,
     pub issue_input: TextArea<'static>,
-    pub pr_input: TextArea<'static>,
 }
 
 /// In-progress switch prerequisites (modules / branch) for a task without a worktree.
@@ -346,6 +362,7 @@ pub struct App {
     pub edit: Option<EditState>,
     pub settings_state: Option<SettingsState>,
     pub field_prompt: Option<FieldPromptState>,
+    pub module_pr_picker: Option<ModulePrPickerState>,
     pub switch_prep: Option<SwitchPrepState>,
     pub release: Option<ReleaseState>,
     pub stale_worktree: Option<StaleWorktreeState>,
@@ -371,6 +388,14 @@ pub struct App {
     should_quit: bool,
 }
 
+/// Result of trying to fill module PRs from Linear attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillPrsResult {
+    Filled,
+    NoMatches,
+    CredentialPending,
+}
+
 impl App {
     pub fn new() -> color_eyre::Result<Self> {
         let tasks = persist::load_all_tasks()?;
@@ -391,6 +416,7 @@ impl App {
             edit: None,
             settings_state: None,
             field_prompt: None,
+            module_pr_picker: None,
             switch_prep: None,
             release: None,
             stale_worktree: None,
@@ -489,6 +515,7 @@ impl App {
             View::Settings => self.handle_settings_key(key)?,
             View::CreatePrompt => self.handle_create_prompt_key(key)?,
             View::FieldPrompt => self.handle_field_prompt_key(key)?,
+            View::ModulePrPicker => self.handle_module_pr_picker_key(key)?,
             View::CredentialPrompt => self.handle_credential_prompt_key(key)?,
             View::CredentialFileBroken => self.handle_credential_file_broken_key(key)?,
             View::SwitchModules => self.handle_switch_modules_key(key)?,
@@ -923,18 +950,12 @@ impl App {
             }
         };
 
-        let (title_input, branch_input, issue_input, pr_input) = {
+        let (title_input, branch_input, issue_input) = {
             let task = &self.tasks[task_idx];
             (
                 text_input::single_line(&task.title),
                 text_input::single_line(task.branch.as_deref().unwrap_or("")),
                 text_input::single_line(task.issue_id.as_deref().unwrap_or("")),
-                text_input::single_line(
-                    task.pr_number
-                        .map(|n| n.to_string())
-                        .as_deref()
-                        .unwrap_or(""),
-                ),
             )
         };
 
@@ -947,7 +968,6 @@ impl App {
             title_input,
             branch_input,
             issue_input,
-            pr_input,
         });
         self.view = View::Edit;
         self.clear_status();
@@ -1056,7 +1076,23 @@ impl App {
                     key: Key::Enter, ..
                 },
             ) => {
-                self.edit_confirm_field()?;
+                if focus == Some(EditFocus::Modules) {
+                    self.edit_module_pr()?;
+                } else {
+                    self.edit_confirm_field()?;
+                }
+                return Ok(());
+            }
+            (
+                Some(EditFocus::Modules),
+                Input {
+                    key: Key::Char('p' | 'P'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.edit_module_pr()?;
                 return Ok(());
             }
             (
@@ -1083,12 +1119,7 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (
-                Some(
-                    EditFocus::Title | EditFocus::Branch | EditFocus::IssueId | EditFocus::PrNumber,
-                ),
-                _,
-            ) => {
+            (Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId), _) => {
                 // Fall through to textarea handling below.
             }
             (
@@ -1113,7 +1144,6 @@ impl App {
             EditFocus::Title => edit.title_input.input(input),
             EditFocus::Branch => edit.branch_input.input(input),
             EditFocus::IssueId => edit.issue_input.input(input),
-            EditFocus::PrNumber => edit.pr_input.input(input),
             EditFocus::Modules | EditFocus::Worktree => false,
         };
         if modified {
@@ -1140,8 +1170,7 @@ impl App {
         edit.focus = match edit.focus {
             EditFocus::Title => EditFocus::Branch,
             EditFocus::Branch => EditFocus::IssueId,
-            EditFocus::IssueId => EditFocus::PrNumber,
-            EditFocus::PrNumber => EditFocus::Modules,
+            EditFocus::IssueId => EditFocus::Modules,
             EditFocus::Modules => EditFocus::Worktree,
             EditFocus::Worktree => EditFocus::Title,
         };
@@ -1161,8 +1190,7 @@ impl App {
             EditFocus::Title => EditFocus::Worktree,
             EditFocus::Branch => EditFocus::Title,
             EditFocus::IssueId => EditFocus::Branch,
-            EditFocus::PrNumber => EditFocus::IssueId,
-            EditFocus::Modules => EditFocus::PrNumber,
+            EditFocus::Modules => EditFocus::IssueId,
             EditFocus::Worktree => EditFocus::Modules,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
@@ -1210,12 +1238,12 @@ impl App {
             return Ok(());
         };
         match edit.focus {
-            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId | EditFocus::PrNumber => {
+            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId => {
                 // Text already persisted on each keystroke; Enter advances focus.
                 self.edit_focus_next();
             }
             EditFocus::Modules | EditFocus::Worktree => {
-                // Enter on modules/worktree: no-op (Space toggles; D clears worktree).
+                // Enter on modules is handled by edit_module_pr; worktree: no-op.
             }
         }
         Ok(())
@@ -1278,7 +1306,7 @@ impl App {
 
     /// Copy focused edit textareas into the underlying task and persist.
     fn sync_edit_inputs_to_task(&mut self) -> color_eyre::Result<()> {
-        let (task_idx, title, branch, issue_id, pr_text) = {
+        let (task_idx, title, branch, issue_id) = {
             let Some(edit) = self.edit.as_ref() else {
                 return Ok(());
             };
@@ -1287,25 +1315,8 @@ impl App {
                 text_input::value(&edit.title_input),
                 text_input::value(&edit.branch_input),
                 text_input::value(&edit.issue_input),
-                text_input::value(&edit.pr_input),
             )
         };
-
-        let pr_number = {
-            let trimmed = pr_text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                match trimmed.parse::<u64>() {
-                    Ok(n) => Some(n),
-                    Err(_) => {
-                        self.set_error("PR number must be a positive integer");
-                        return Ok(());
-                    }
-                }
-            }
-        };
-
         let Some(task) = self.tasks.get_mut(task_idx) else {
             return Ok(());
         };
@@ -1326,10 +1337,40 @@ impl App {
                 Some(issue_id)
             }
         };
-        task.pr_number = pr_number;
         task.touch();
         persist::save_task(task)?;
         self.sort_tasks_preserving_edit(task_idx)?;
+        Ok(())
+    }
+
+    /// Prompt to set / clear the PR number for the highlighted module.
+    fn edit_module_pr(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let Some(module) = edit.available_modules.get(edit.module_cursor).cloned() else {
+            self.set_error("No module highlighted");
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        let stem = task.file_stem.clone();
+        let existing = task
+            .module_prs
+            .get(&module)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        self.open_field_prompt_seeded(
+            FieldPromptKind::PrNumber {
+                task_stem: stem,
+                module,
+                return_to: View::Edit,
+                open_after: false,
+            },
+            &existing,
+        );
         Ok(())
     }
 
@@ -1348,6 +1389,7 @@ impl App {
         };
         if let Some(pos) = task.modules.iter().position(|m| m == &module_name) {
             task.modules.remove(pos);
+            task.module_prs.remove(&module_name);
         } else {
             task.modules.push(module_name);
         }
@@ -1544,44 +1586,42 @@ impl App {
         let Some(task) = self.tasks.get(task_idx) else {
             return Ok(());
         };
-        if let Some(pr) = task.pr_number {
-            return self.open_pr_url(pr);
+        if task.modules.is_empty() {
+            self.set_error("Select at least one module on the task before opening a PR");
+            return Ok(());
         }
 
-        let issue_id = task.issue_id.clone();
         let stem = task.file_stem.clone();
+        let issue_id = task.issue_id.clone();
+        let modules = task.modules.clone();
+        let missing_prs = modules.iter().any(|m| !task.module_prs.contains_key(m));
 
-        if let Some(issue_id) = issue_id {
-            match self.lookup_pr_from_linear(&issue_id, &stem, api_key_override)? {
-                Some(pr) => {
-                    if let Some(task) = self.tasks.get_mut(task_idx) {
-                        task.pr_number = Some(pr);
-                        task.touch();
-                        persist::save_task(task)?;
-                    }
-                    self.open_pr_url(pr)?;
-                    return Ok(());
-                }
-                None => {
-                    // Credential prompt opened, or lookup failed / no PR found
-                    // (prompt or error already set).
-                    return Ok(());
+        // Fill missing module PRs from Linear when possible.
+        if missing_prs {
+            if let Some(issue_id) = issue_id {
+                match self.fill_module_prs_from_linear(
+                    task_idx,
+                    &issue_id,
+                    &stem,
+                    api_key_override,
+                )? {
+                    FillPrsResult::Filled | FillPrsResult::NoMatches => {}
+                    FillPrsResult::CredentialPending => return Ok(()),
                 }
             }
         }
 
-        self.open_field_prompt(FieldPromptKind::PrNumber { task_stem: stem });
-        Ok(())
+        self.continue_open_pr_after_lookup(task_idx)
     }
 
-    /// Returns `Some(pr)` when found, `None` when prompting for credentials or giving up
-    /// (caller should not open a second prompt if credentials were requested).
-    fn lookup_pr_from_linear(
+    /// Match Linear attachment PR repos to task modules; persist any new assignments.
+    fn fill_module_prs_from_linear(
         &mut self,
+        task_idx: usize,
         issue_id: &str,
         task_stem: &str,
         api_key_override: Option<&str>,
-    ) -> color_eyre::Result<Option<u64>> {
+    ) -> color_eyre::Result<FillPrsResult> {
         let api_key = if let Some(key) = api_key_override {
             key.to_string()
         } else {
@@ -1594,7 +1634,7 @@ impl App {
                         },
                         CredentialPromptKind::Missing,
                     );
-                    return Ok(None);
+                    return Ok(FillPrsResult::CredentialPending);
                 }
                 Ok(credentials::LoadLinearApiKey::UnreadableFile { path }) => {
                     self.open_credential_file_broken(
@@ -1603,27 +1643,18 @@ impl App {
                         },
                         path,
                     );
-                    return Ok(None);
+                    return Ok(FillPrsResult::CredentialPending);
                 }
                 Err(err) => {
                     self.set_error(format!("{err:#}"));
                     self.view = View::TaskList;
-                    return Ok(None);
+                    return Ok(FillPrsResult::CredentialPending);
                 }
             }
         };
 
-        match linear::fetch_pr_number_for_issue(&api_key, issue_id) {
-            Ok(Some(pr)) => Ok(Some(pr)),
-            Ok(None) => {
-                self.set_status(format!(
-                    "No PR linked on Linear for {issue_id} — enter PR number"
-                ));
-                self.open_field_prompt(FieldPromptKind::PrNumber {
-                    task_stem: task_stem.to_string(),
-                });
-                Ok(None)
-            }
+        let linked = match linear::fetch_linked_prs_for_issue(&api_key, issue_id) {
+            Ok(prs) => prs,
             Err(linear::IssueLookupError::Unauthorized) => {
                 self.open_credential_prompt_for(
                     PendingCredentialAction::OpenPr {
@@ -1631,37 +1662,183 @@ impl App {
                     },
                     CredentialPromptKind::Invalid,
                 );
-                Ok(None)
+                return Ok(FillPrsResult::CredentialPending);
             }
             Err(linear::IssueLookupError::Other(err)) => {
                 self.set_error(format!("Linear PR lookup failed: {err:#}"));
-                self.open_field_prompt(FieldPromptKind::PrNumber {
-                    task_stem: task_stem.to_string(),
-                });
-                Ok(None)
+                // Continue without Linear data so the user can still pick / enter.
+                return Ok(FillPrsResult::NoMatches);
             }
+        };
+
+        let Some(task) = self.tasks.get_mut(task_idx) else {
+            return Ok(FillPrsResult::NoMatches);
+        };
+        let mut filled = 0usize;
+        for pr in &linked {
+            if task.modules.iter().any(|m| m == &pr.repository)
+                && !task.module_prs.contains_key(&pr.repository)
+            {
+                task.module_prs.insert(pr.repository.clone(), pr.number);
+                filled += 1;
+            }
+        }
+        if filled > 0 {
+            task.touch();
+            persist::save_task(task)?;
+            Ok(FillPrsResult::Filled)
+        } else {
+            Ok(FillPrsResult::NoMatches)
         }
     }
 
+    fn continue_open_pr_after_lookup(&mut self, task_idx: usize) -> color_eyre::Result<()> {
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        let stem = task.file_stem.clone();
+        let with_prs = task.modules_with_prs();
+
+        match with_prs.len() {
+            1 => {
+                let (module, pr) = &with_prs[0];
+                self.open_pr_url(module, *pr)?;
+            }
+            n if n > 1 => {
+                let options = with_prs.into_iter().map(|(m, pr)| (m, Some(pr))).collect();
+                self.open_module_pr_picker(stem, options);
+            }
+            _ => {
+                // No known PRs — pick among associated modules (or prompt if only one).
+                let modules = task.modules.clone();
+                match modules.len() {
+                    0 => self.set_error("No modules on this task"),
+                    1 => {
+                        self.open_field_prompt(FieldPromptKind::PrNumber {
+                            task_stem: stem,
+                            module: modules[0].clone(),
+                            return_to: View::TaskList,
+                            open_after: true,
+                        });
+                    }
+                    _ => {
+                        let options = modules.into_iter().map(|m| (m, None)).collect();
+                        self.open_module_pr_picker(stem, options);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_module_pr_picker(&mut self, task_stem: String, options: Vec<(String, Option<u64>)>) {
+        self.module_pr_picker = Some(ModulePrPickerState {
+            task_stem,
+            options,
+            cursor: 0,
+        });
+        self.view = View::ModulePrPicker;
+        self.set_status("Select a module to open its PR");
+    }
+
+    fn handle_module_pr_picker_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.module_pr_picker = None;
+                self.view = View::TaskList;
+                self.clear_status();
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = self.module_pr_picker.as_mut() {
+                    let len = picker.options.len();
+                    if len > 0 {
+                        picker.cursor = (picker.cursor + 1) % len;
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = self.module_pr_picker.as_mut() {
+                    let len = picker.options.len();
+                    if len > 0 {
+                        picker.cursor = if picker.cursor == 0 {
+                            len - 1
+                        } else {
+                            picker.cursor - 1
+                        };
+                    }
+                }
+            }
+            KeyCode::Enter => self.confirm_module_pr_picker()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn confirm_module_pr_picker(&mut self) -> color_eyre::Result<()> {
+        let Some(picker) = self.module_pr_picker.as_ref() else {
+            return Ok(());
+        };
+        let Some((module, pr)) = picker.options.get(picker.cursor).cloned() else {
+            return Ok(());
+        };
+        let stem = picker.task_stem.clone();
+        self.module_pr_picker = None;
+        match pr {
+            Some(pr) => self.open_pr_url(&module, pr)?,
+            None => {
+                self.open_field_prompt(FieldPromptKind::PrNumber {
+                    task_stem: stem,
+                    module,
+                    return_to: View::TaskList,
+                    open_after: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn open_field_prompt(&mut self, kind: FieldPromptKind) {
+        self.open_field_prompt_seeded(kind, "");
+    }
+
+    fn open_field_prompt_seeded(&mut self, kind: FieldPromptKind, initial: &str) {
         let hint = match &kind {
             FieldPromptKind::IssueId { .. } => "Enter issue ID (e.g. ENG-123)",
-            FieldPromptKind::PrNumber { .. } => "Enter PR number",
+            FieldPromptKind::PrNumber { module, .. } => {
+                // Status set below with module name.
+                let _ = module;
+                "Enter PR number (empty clears)"
+            }
+        };
+        let status = match &kind {
+            FieldPromptKind::IssueId { .. } => hint.to_string(),
+            FieldPromptKind::PrNumber { module, .. } => {
+                format!("PR number for module `{module}` (empty clears)")
+            }
         };
         self.field_prompt = Some(FieldPromptState {
             kind,
-            input: text_input::single_line(""),
+            input: text_input::single_line(initial),
         });
         self.view = View::FieldPrompt;
-        self.set_status(hint);
+        self.set_status(status);
     }
 
     fn handle_field_prompt_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
         let input = Input::from(key);
         match input {
             Input { key: Key::Esc, .. } => {
+                let return_to = self
+                    .field_prompt
+                    .as_ref()
+                    .map(|p| match &p.kind {
+                        FieldPromptKind::IssueId { .. } => View::TaskList,
+                        FieldPromptKind::PrNumber { return_to, .. } => *return_to,
+                    })
+                    .unwrap_or(View::TaskList);
                 self.field_prompt = None;
-                self.view = View::TaskList;
+                self.view = return_to;
                 self.clear_status();
             }
             Input {
@@ -1689,15 +1866,16 @@ impl App {
         };
         let value = text_input::value(&prompt.input);
         let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            self.set_error("Value cannot be empty");
-            return Ok(());
-        }
         let kind = prompt.kind.clone();
         self.field_prompt = None;
 
         match kind {
             FieldPromptKind::IssueId { task_stem } => {
+                if trimmed.is_empty() {
+                    self.open_field_prompt(FieldPromptKind::IssueId { task_stem });
+                    self.set_error("Issue ID cannot be empty");
+                    return Ok(());
+                }
                 let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem)
                 else {
                     self.view = View::TaskList;
@@ -1712,15 +1890,30 @@ impl App {
                 self.view = View::TaskList;
                 self.open_issue_url(&trimmed)?;
             }
-            FieldPromptKind::PrNumber { task_stem } => {
-                let pr: u64 = match trimmed.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        self.open_field_prompt(FieldPromptKind::PrNumber { task_stem });
-                        self.set_error("PR number must be a positive integer");
-                        return Ok(());
+            FieldPromptKind::PrNumber {
+                task_stem,
+                module,
+                return_to,
+                open_after,
+            } => {
+                let pr_opt = if trimmed.is_empty() {
+                    None
+                } else {
+                    match trimmed.parse::<u64>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            self.open_field_prompt(FieldPromptKind::PrNumber {
+                                task_stem,
+                                module,
+                                return_to,
+                                open_after,
+                            });
+                            self.set_error("PR number must be a positive integer");
+                            return Ok(());
+                        }
                     }
                 };
+
                 let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem)
                 else {
                     self.view = View::TaskList;
@@ -1728,12 +1921,41 @@ impl App {
                     return Ok(());
                 };
                 if let Some(task) = self.tasks.get_mut(task_idx) {
-                    task.pr_number = Some(pr);
+                    match pr_opt {
+                        Some(pr) => {
+                            if !task.modules.iter().any(|m| m == &module) {
+                                task.modules.push(module.clone());
+                            }
+                            task.module_prs.insert(module.clone(), pr);
+                        }
+                        None => {
+                            task.module_prs.remove(&module);
+                        }
+                    }
                     task.touch();
                     persist::save_task(task)?;
                 }
-                self.view = View::TaskList;
-                self.open_pr_url(pr)?;
+
+                if open_after {
+                    if let Some(pr) = pr_opt {
+                        self.view = View::TaskList;
+                        self.open_pr_url(&module, pr)?;
+                    } else {
+                        self.view = View::TaskList;
+                        self.set_error("PR number required to open");
+                    }
+                } else {
+                    self.view = return_to;
+                    if return_to == View::Edit {
+                        // Keep edit state; cursor already on the module.
+                        self.set_status(match pr_opt {
+                            Some(pr) => format!("Set PR #{pr} for `{module}`"),
+                            None => format!("Cleared PR for `{module}`"),
+                        });
+                    } else {
+                        self.clear_status();
+                    }
+                }
             }
         }
         Ok(())
@@ -1759,30 +1981,26 @@ impl App {
         Ok(())
     }
 
-    fn open_pr_url(&mut self, pr_number: u64) -> color_eyre::Result<()> {
-        let (namespace, repository) = match env::current_dir()
+    fn open_pr_url(&mut self, module: &str, pr_number: u64) -> color_eyre::Result<()> {
+        let namespace = match env::current_dir()
             .map_err(|e| eyre!("{e}"))
             .and_then(|cwd| gitutil::repo_toplevel(&cwd))
             .and_then(|root| gitutil::remote_namespace_and_repo(&root, "origin"))
         {
-            Ok(pair) => pair,
+            Ok((ns, _)) => ns,
             Err(err) => {
                 self.view = View::TaskList;
-                self.set_error(format!(
-                    "Could not resolve git remote namespace/repo: {err:#}"
-                ));
+                self.set_error(format!("Could not resolve git remote namespace: {err:#}"));
                 return Ok(());
             }
         };
 
-        match self
-            .settings
-            .build_pr_url(&namespace, &repository, pr_number)
-        {
+        // `{repository}` is the associated module name.
+        match self.settings.build_pr_url(&namespace, module, pr_number) {
             Ok(url) => match settings::open_in_browser(&url) {
                 Ok(()) => {
                     self.view = View::TaskList;
-                    self.set_status(format!("Opened PR #{pr_number}"));
+                    self.set_status(format!("Opened {module} PR #{pr_number}"));
                 }
                 Err(err) => {
                     self.view = View::TaskList;
