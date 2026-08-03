@@ -7,7 +7,7 @@ use tui_textarea::{CursorRenderMode, TextArea};
 
 use crate::app::{
     App, BranchLockedAction, CredentialPromptKind, EditFocus, FieldPromptKind, SettingsFocus,
-    StaleWorktreeAction, View,
+    StaleWorktreeAction, TaskListRow, View,
 };
 use crate::credentials;
 use crate::dirty;
@@ -86,14 +86,22 @@ fn format_task_row(
 
 fn draw_task_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
-        .active_tasks()
-        .map(|(_, task)| {
-            format_task_row(
-                &task.title,
-                task.issue_id.as_deref(),
-                task.branch.as_deref(),
-                task.worktree.as_ref().map(|wt| wt.number),
-            )
+        .task_list_rows()
+        .into_iter()
+        .map(|row| match row {
+            TaskListRow::Divider => ListItem::new(Line::from(Span::styled(
+                "── waiting ──",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            TaskListRow::Task(idx) => {
+                let task = &app.tasks[idx];
+                format_task_row(
+                    &task.title,
+                    task.issue_id.as_deref(),
+                    task.branch.as_deref(),
+                    task.worktree.as_ref().map(|wt| wt.number),
+                )
+            }
         })
         .collect();
 
@@ -1334,7 +1342,7 @@ fn footer_context(app: &App) -> Option<String> {
 fn footer_controls(app: &App) -> String {
     match app.view {
         View::TaskList => {
-            "↑/↓ move  Enter open  N new  E edit  I issue  P PR  R release  A archive  Shift+A archive  S settings  Q quit"
+            "↑/↓ move  Enter open  N new  E edit  I issue  P PR  R release  W wait  A archive  Shift+A archive  S settings  Q quit"
                 .to_string()
         }
         View::Archive => "↑/↓ move  U unarchive  Esc back  Q quit".to_string(),

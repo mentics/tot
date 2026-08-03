@@ -73,6 +73,15 @@ pub enum View {
     ConfirmDelete,
 }
 
+/// One row in the main task list (active tasks, optional waiting divider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskListRow {
+    /// Index into [`App::tasks`].
+    Task(usize),
+    /// Separator above the waiting block when any active task is waiting.
+    Divider,
+}
+
 /// What to resume after the user supplies Linear credentials.
 #[derive(Debug, Clone)]
 enum PendingCredentialAction {
@@ -621,6 +630,7 @@ impl App {
             KeyCode::Char('p') | KeyCode::Char('P') => self.open_pr_for_list_selection()?,
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('r') | KeyCode::Char('R') => self.release_selected(terminal)?,
+            KeyCode::Char('w') | KeyCode::Char('W') => self.toggle_waiting_selected()?,
             KeyCode::Char('n') | KeyCode::Char('N') => self.open_create_prompt(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_list(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_list(),
@@ -630,9 +640,28 @@ impl App {
         Ok(())
     }
 
-    /// Active (non-archived) task rows only.
+    /// Active list rows: non-waiting tasks, optional divider, then waiting tasks.
+    pub(crate) fn task_list_rows(&self) -> Vec<TaskListRow> {
+        let mut non_waiting = Vec::new();
+        let mut waiting = Vec::new();
+        for (i, task) in self.active_tasks() {
+            if task.waiting {
+                waiting.push(TaskListRow::Task(i));
+            } else {
+                non_waiting.push(TaskListRow::Task(i));
+            }
+        }
+        let mut rows = non_waiting;
+        if !waiting.is_empty() {
+            rows.push(TaskListRow::Divider);
+            rows.extend(waiting);
+        }
+        rows
+    }
+
+    /// Active list UI rows (includes waiting divider when present).
     pub fn task_list_row_count(&self) -> usize {
-        self.active_tasks().count()
+        self.task_list_rows().len()
     }
 
     pub fn active_tasks(&self) -> impl Iterator<Item = (usize, &Task)> {
@@ -647,9 +676,12 @@ impl App {
         self.tasks.iter().filter(|t| t.archived).count()
     }
 
-    /// Map list UI index to `tasks` index.
+    /// Map list UI index to `tasks` index (`None` for the waiting divider).
     fn tasks_index_for_list_row(&self, row: usize) -> Option<usize> {
-        self.active_tasks().nth(row).map(|(i, _)| i)
+        match self.task_list_rows().get(row)? {
+            TaskListRow::Task(i) => Some(*i),
+            TaskListRow::Divider => None,
+        }
     }
 
     fn open_create_prompt(&mut self) {
@@ -664,25 +696,67 @@ impl App {
         self.tasks.get(idx)
     }
 
+    /// Indices of rows that are tasks (skip the waiting divider).
+    fn task_list_selectable_rows(&self) -> Vec<usize> {
+        self.task_list_rows()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| matches!(r, TaskListRow::Task(_)).then_some(i))
+            .collect()
+    }
+
     fn select_next_list(&mut self) {
-        let len = self.task_list_row_count();
-        if len == 0 {
+        let task_rows = self.task_list_selectable_rows();
+        if task_rows.is_empty() {
             return;
         }
-        let i = self.list_state.selected().map_or(0, |i| (i + 1) % len);
-        self.list_state.select(Some(i));
+        let next = match self
+            .list_state
+            .selected()
+            .and_then(|c| task_rows.iter().position(|&r| r == c))
+        {
+            Some(pos) => task_rows[(pos + 1) % task_rows.len()],
+            None => task_rows[0],
+        };
+        self.list_state.select(Some(next));
     }
 
     fn select_previous_list(&mut self) {
-        let len = self.task_list_row_count();
-        if len == 0 {
+        let task_rows = self.task_list_selectable_rows();
+        if task_rows.is_empty() {
             return;
         }
-        let i = self
+        let prev = match self
             .list_state
             .selected()
-            .map_or(0, |i| if i == 0 { len - 1 } else { i - 1 });
-        self.list_state.select(Some(i));
+            .and_then(|c| task_rows.iter().position(|&r| r == c))
+        {
+            Some(0) => task_rows[task_rows.len() - 1],
+            Some(pos) => task_rows[pos - 1],
+            None => task_rows[0],
+        };
+        self.list_state.select(Some(prev));
+    }
+
+    fn toggle_waiting_selected(&mut self) -> color_eyre::Result<()> {
+        let Some(task_idx) = self.selected_list_task_idx() else {
+            self.set_error("Select a task to toggle waiting");
+            return Ok(());
+        };
+
+        let stem = self.tasks[task_idx].file_stem.clone();
+        self.tasks[task_idx].waiting = !self.tasks[task_idx].waiting;
+        let waiting = self.tasks[task_idx].waiting;
+        self.tasks[task_idx].touch();
+        persist::save_task(&self.tasks[task_idx])?;
+        self.sort_tasks();
+        self.select_active_task_by_stem(&stem);
+        self.set_status(if waiting {
+            "Marked waiting"
+        } else {
+            "Cleared waiting"
+        });
+        Ok(())
     }
 
     fn activate_list_selection(&mut self) {
@@ -891,16 +965,25 @@ impl App {
 
     fn clamp_list_selection(&mut self) {
         let len = self.task_list_row_count();
+        let rows = self.task_list_rows();
+        let task_rows = self.task_list_selectable_rows();
+        if len == 0 || task_rows.is_empty() {
+            self.list_state.select(None);
+            return;
+        }
         match self.list_state.selected() {
-            Some(i) if i >= len => {
-                if len == 0 {
-                    self.list_state.select(None);
-                } else {
-                    self.list_state.select(Some(len - 1));
-                }
+            Some(i) if i < len && matches!(rows.get(i), Some(TaskListRow::Task(_))) => {}
+            Some(i) => {
+                // Off the end or on the divider: pick nearest task row.
+                let next = task_rows
+                    .iter()
+                    .copied()
+                    .find(|&r| r > i)
+                    .or_else(|| task_rows.iter().copied().rev().find(|&r| r < i))
+                    .unwrap_or(task_rows[0]);
+                self.list_state.select(Some(next));
             }
-            None if len > 0 => self.list_state.select(Some(0)),
-            _ => {}
+            None => self.list_state.select(Some(task_rows[0])),
         }
     }
 
@@ -2775,11 +2858,12 @@ impl App {
     }
 
     fn select_active_task_by_stem(&mut self, stem: &str) {
-        let row = self
-            .active_tasks()
-            .enumerate()
-            .find(|(_, (_, task))| task.file_stem == stem)
-            .map(|(row, _)| row);
+        let row = self.task_list_rows().iter().enumerate().find_map(|(row, r)| {
+            match r {
+                TaskListRow::Task(i) if self.tasks[*i].file_stem == stem => Some(row),
+                _ => None,
+            }
+        });
         if let Some(row) = row {
             self.list_state.select(Some(row));
         }

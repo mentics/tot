@@ -18,6 +18,19 @@ Progress and decisions while implementing `doc/features.md`.
 
 ## Log
 
+### 2026-08-03 — waiting on main list
+
+**Completed**
+- `Task.waiting` bool (`#[serde(default)]`, default false); stays active when set.
+- Main list **W** toggles waiting: touch + persist + sort + reselect by stem (no worktree release).
+- When any active task is waiting: non-waiting → dim `── waiting ──` divider → waiting; ↑/↓ skip divider. No divider when none waiting.
+- Archive view unchanged; waiting ignored while archived.
+
+**Decisions**
+- No separate Waiting view, status enum, or per-row waiting badge (divider only).
+
+**Blockers:** none.
+
 ### 2026-07-30 — task notes on edit view
 
 **Completed**

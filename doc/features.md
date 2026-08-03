@@ -32,8 +32,9 @@ tod always uses the **current working directory** as the main git repository. Av
 | Modules | list of string | Required; may be empty. See [Modules](#modules) |
 | Notes | list of Note | Optional; free-form notes on the task. Sorted **newest first** in the edit view. See [Notes](#notes) |
 | Worktree | Worktree? | Optional; tracked automatically (not set in the edit view). See [Worktree](#worktree) |
-| Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
+| Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, toggle waiting, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
 | Archived | bool | When true, the task appears only in the [Archive view](#2-archive-view), not the main list |
+| Waiting | bool | When true on an **active** (non-archived) task, the main list shows it below a **── waiting ──** divider. Ignored while archived (field left as-is). Default `false` |
 
 ### Notes
 
@@ -89,7 +90,7 @@ Keybindings are fixed for now (not user-remappable).
 
 ### 1. Task list (main / initial view)
 
-Active (non-archived) tasks, sorted by **last used descending**.
+Active (non-archived) tasks, sorted by **last used descending**. When one or more active tasks are **waiting**, the list is one scrollable view: non-waiting tasks first, then a dim **── waiting ──** divider, then waiting tasks (each block still by last used descending). With no waiting tasks, there is no divider.
 
 Each task row shows:
 
@@ -99,13 +100,14 @@ Each task row shows:
 
 | Key | Action |
 | --- | --- |
-| ↑ / ↓ | Move selection |
+| ↑ / ↓ | Move selection (skips the waiting divider) |
 | Enter | [Switch](#switch-to-a-task) to the selected task |
 | N | [Create new task](#create-new-task) |
 | E | Open [Edit view](#3-edit-view) for the selected task |
 | I | [Open issue](#open-issue) for the selected task in the browser |
 | P | [Open PR](#open-pr) for the selected task in the browser |
 | R | [Release worktree](#release-worktree) for the selected task (without archiving) |
+| W | [Toggle waiting](#toggle-waiting) on the selected task |
 | A | [Archive](#archive-task) the selected task |
 | Shift+A | Open [Archive view](#2-archive-view) |
 | S | Open [Settings view](#4-settings-view) |
@@ -270,6 +272,15 @@ From the task list, press **A** on a task:
 1. If the task has a worktree association, run [Release worktree](#release-worktree) first (including the dirty check). If release is cancelled or blocked, do **not** archive.
 2. Set `Archived = true`, update **last used**, persist.
 3. The task leaves the main list and appears in the archive view.
+
+### Toggle waiting
+
+From the task list, press **W** on a task:
+
+1. Flip `Waiting`, update **last used**, persist.
+2. Re-sort the main list and keep selection on that task (by file stem). Does **not** release a worktree; the task stays active.
+
+Waiting tasks remain on the main list under the waiting divider. Archive view does not interpret waiting (leave the field unchanged while archived).
 
 ### Unarchive task
 

@@ -35,6 +35,8 @@ pub struct Task {
     pub last_used: DateTime<Utc>,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 /// A timestamped note attached to a task.
@@ -74,6 +76,7 @@ impl Task {
             notes: Vec::new(),
             last_used: Utc::now(),
             archived: false,
+            waiting: false,
         }
     }
 
