@@ -31,3 +31,25 @@ pub fn single_line_masked(initial: impl AsRef<str>) -> TextArea<'static> {
 pub fn value(ta: &TextArea<'_>) -> String {
     ta.lines().first().cloned().unwrap_or_default()
 }
+
+/// Multi-line editor for notes (and similar free-form text).
+pub fn multi_line(initial: impl AsRef<str>) -> TextArea<'static> {
+    let initial = initial.as_ref();
+    let mut ta = if initial.is_empty() {
+        TextArea::default()
+    } else {
+        TextArea::from(initial.lines().map(str::to_string).collect::<Vec<_>>())
+    };
+    ta.set_cursor_line_style(Style::default());
+    ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    if !initial.is_empty() {
+        ta.move_cursor(CursorMove::Bottom);
+        ta.move_cursor(CursorMove::End);
+    }
+    ta
+}
+
+/// Join all lines with `\n` (preserves trailing empty line from TextArea).
+pub fn multi_value(ta: &TextArea<'_>) -> String {
+    ta.lines().join("\n")
+}

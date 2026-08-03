@@ -18,6 +18,22 @@ Progress and decisions while implementing `doc/features.md`.
 
 ## Log
 
+### 2026-07-30 — task notes on edit view
+
+**Completed**
+- `Task.notes` list of `{ body, created_at }`; newest-first sort on load/add; persisted with the task JSON.
+- Edit view Notes pane: one-line truncated previews; Enter opens full note; N/A compose (Ctrl+S save); Del/D delete.
+- Full note view styles `http(s)` URLs; Ctrl+click opens in the browser (mouse capture enabled).
+
+**Decisions**
+- Notes are add/view/delete only (no in-place edit of existing notes yet).
+- Composer uses Ctrl+S so Enter can insert newlines.
+
+**Follow-ups**
+- Optional: edit an existing note.
+
+**Blockers:** none.
+
 ### 2026-07-30 — switch activate fast path
 
 **Completed**

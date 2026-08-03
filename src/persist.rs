@@ -67,6 +67,7 @@ fn load_task_file(path: &Path) -> color_eyre::Result<Task> {
         .ok_or_else(|| eyre!("task file has no UTF-8 stem: {}", path.display()))?;
     task.file_stem = stem.to_string();
     task.migrate_legacy_pr();
+    task.sort_notes();
     Ok(task)
 }
 
@@ -79,6 +80,20 @@ pub fn save_task(task: &Task) -> color_eyre::Result<()> {
     let path = dir.join(format!("{}.json", task.file_stem));
     let json = serde_json::to_string_pretty(task).wrap_err("serializing task")?;
     fs::write(&path, json).wrap_err_with(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Permanently remove `{config}/tasks/{file_stem}.json`.
+pub fn delete_task(file_stem: &str) -> color_eyre::Result<()> {
+    if file_stem.is_empty() {
+        return Err(eyre!("cannot delete task with empty file_stem"));
+    }
+    let dir = ensure_tasks_dir()?;
+    let path = dir.join(format!("{file_stem}.json"));
+    if !path.exists() {
+        return Err(eyre!("task file not found: {}", path.display()));
+    }
+    fs::remove_file(&path).wrap_err_with(|| format!("removing {}", path.display()))?;
     Ok(())
 }
 
@@ -177,6 +192,10 @@ mod tests {
         assert_eq!(loaded[0].branch.as_deref(), Some("feat/x"));
         assert_eq!(loaded[0].file_stem, task.file_stem);
         assert!(!loaded[0].archived);
+
+        delete_task(&task.file_stem).expect("delete");
+        let loaded = load_all_tasks().expect("load after delete");
+        assert!(loaded.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
         unsafe {

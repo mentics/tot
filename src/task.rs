@@ -29,9 +29,28 @@ pub struct Task {
     pub modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
+    /// Free-form notes; newest first in the UI (see [`Task::sort_notes`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
     pub last_used: DateTime<Utc>,
     #[serde(default)]
     pub archived: bool,
+}
+
+/// A timestamped note attached to a task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Note {
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Note {
+    pub fn new(body: impl Into<String>) -> Self {
+        Self {
+            body: body.into(),
+            created_at: Utc::now(),
+        }
+    }
 }
 
 /// Associated Treehouse worktree for a task.
@@ -52,9 +71,21 @@ impl Task {
             legacy_pr_number: None,
             modules: Vec::new(),
             worktree: None,
+            notes: Vec::new(),
             last_used: Utc::now(),
             archived: false,
         }
+    }
+
+    /// Keep notes ordered most-recent-first.
+    pub fn sort_notes(&mut self) {
+        self.notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+    }
+
+    /// Insert a note and keep the list sorted newest-first.
+    pub fn add_note(&mut self, body: impl Into<String>) {
+        self.notes.push(Note::new(body));
+        self.sort_notes();
     }
 
     /// Move a legacy top-level `pr_number` into [`Self::module_prs`] when possible.

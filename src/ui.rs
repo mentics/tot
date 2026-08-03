@@ -11,6 +11,7 @@ use crate::app::{
 };
 use crate::credentials;
 use crate::dirty;
+use crate::note_util;
 use crate::settings::{
     ISSUE_ID_PLACEHOLDER, NAMESPACE_PLACEHOLDER, PR_NUMBER_PLACEHOLDER, REPOSITORY_PLACEHOLDER,
 };
@@ -36,6 +37,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::DirtyWarning => draw_dirty_warning(frame, body, app),
         View::StaleWorktree => draw_stale_worktree(frame, body, app),
         View::BranchLocked => draw_branch_locked(frame, body, app),
+        View::NoteDetail => draw_note_view(frame, body, app),
+        View::NoteCompose => draw_note_compose(frame, body, app),
+        View::ConfirmDelete => draw_confirm_delete(frame, body, app),
     }
     draw_footer(frame, footer, app);
 }
@@ -81,19 +85,17 @@ fn format_task_row(
 }
 
 fn draw_task_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(Span::styled(
-        "+ Create new task",
-        Style::default().fg(Color::Green),
-    )))];
-
-    for (_, task) in app.active_tasks() {
-        items.push(format_task_row(
-            &task.title,
-            task.issue_id.as_deref(),
-            task.branch.as_deref(),
-            task.worktree.as_ref().map(|wt| wt.number),
-        ));
-    }
+    let items: Vec<ListItem> = app
+        .active_tasks()
+        .map(|(_, task)| {
+            format_task_row(
+                &task.title,
+                task.issue_id.as_deref(),
+                task.branch.as_deref(),
+                task.worktree.as_ref().map(|wt| wt.number),
+            )
+        })
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().title("Tasks").borders(Borders::ALL))
@@ -177,10 +179,18 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let [title_area, branch_area, issue_area, modules, readonly] = Layout::vertical([
+    let [
+        title_area,
+        branch_area,
+        issue_area,
+        modules,
+        notes_area,
+        readonly,
+    ] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
+        Constraint::Fill(1),
         Constraint::Fill(1),
         Constraint::Length(4),
     ])
@@ -254,6 +264,52 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
     );
     frame.render_widget(modules_list, modules);
 
+    let notes_inner_width = notes_area.width.saturating_sub(4) as usize;
+    let preview_width = notes_inner_width.saturating_sub(2); // cursor prefix
+    let note_items: Vec<ListItem> = if task.notes.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  (no notes — press N to add)",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        task.notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| {
+                let preview = note_util::one_line_preview(&note.body, preview_width.max(1));
+                let cursor = if edit.focus == EditFocus::Notes && i == edit.note_cursor {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if edit.focus == EditFocus::Notes && i == edit.note_cursor {
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{cursor}{preview}"),
+                    style,
+                )))
+            })
+            .collect()
+    };
+
+    let notes_title = if edit.focus == EditFocus::Notes {
+        "Notes (Enter view, N add, Del delete)"
+    } else {
+        "Notes"
+    };
+    let notes_list = List::new(note_items).block(
+        Block::default()
+            .title(notes_title)
+            .borders(Borders::ALL)
+            .border_style(focus_style(edit.focus == EditFocus::Notes)),
+    );
+    frame.render_widget(notes_list, notes_area);
+
     let wt_focused = focus == EditFocus::Worktree;
     let (wt_text, wt_hint) = match &task.worktree {
         Some(wt) => {
@@ -300,6 +356,139 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
             .border_style(focus_style(wt_focused)),
     );
     frame.render_widget(readonly_widget, readonly);
+}
+
+fn draw_note_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.note_view.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("No note selected").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+    let task_idx = state.task_idx;
+    let note_idx = state.note_idx;
+    let scroll = state.scroll;
+
+    let Some(task) = app.tasks.get(task_idx) else {
+        frame.render_widget(
+            Paragraph::new("Task missing").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+    let Some(note) = task.notes.get(note_idx) else {
+        frame.render_widget(
+            Paragraph::new("Note missing").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+
+    let created = note.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
+    let body = note.body.clone();
+    let block = Block::default()
+        .title(format!("Note — {created}"))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width.max(1) as usize;
+    let rows = note_util::layout_note(&body, width);
+    let urls = note_util::find_urls(&body);
+    let visible = inner.height;
+    let max_scroll = rows.len().saturating_sub(visible as usize) as u16;
+    let scroll = scroll.min(max_scroll);
+
+    let link_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let visual = row_idx as i32 - scroll as i32;
+        if visual < 0 || visual >= visible as i32 {
+            continue;
+        }
+        let mut spans = Vec::new();
+        let mut col = 0usize;
+        let chars: Vec<char> = row.text.chars().collect();
+        while col < chars.len() {
+            let src = row.col_to_src.get(col).copied().unwrap_or(col);
+            if let Some(url) = urls.iter().find(|u| src >= u.start && src < u.end) {
+                let mut url_text = String::new();
+                while col < chars.len() {
+                    let s = row.col_to_src[col];
+                    if s >= url.start && s < url.end {
+                        url_text.push(chars[col]);
+                        col += 1;
+                    } else {
+                        break;
+                    }
+                }
+                spans.push(Span::styled(url_text, link_style));
+            } else {
+                let mut plain = String::new();
+                while col < chars.len() {
+                    let s = row.col_to_src[col];
+                    if urls.iter().any(|u| s >= u.start && s < u.end) {
+                        break;
+                    }
+                    plain.push(chars[col]);
+                    col += 1;
+                }
+                spans.push(Span::raw(plain));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let hits = note_util::visible_link_hits(&rows, &urls, inner.x, inner.y, scroll, visible);
+    if let Some(state) = app.note_view.as_mut() {
+        state.scroll = scroll;
+        state.link_hits = hits;
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_note_compose(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.note_compose.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("Compose unavailable").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+
+    let [hint_area, editor_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
+
+    let hint = Paragraph::new(vec![
+        Line::from("New note"),
+        Line::from(Span::styled(
+            "Ctrl+S save · Esc cancel · Enter for newline",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(hint, hint_area);
+
+    state.input.set_block(
+        Block::default()
+            .title("Note body")
+            .borders(Borders::ALL)
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+    );
+    state.input.set_cursor_line_style(Style::default());
+    state
+        .input
+        .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(&state.input, editor_area);
 }
 
 fn draw_settings(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -586,6 +775,45 @@ fn draw_credential_file_broken(frame: &mut Frame, area: Rect, app: &App) {
                 .title("Credential file")
                 .borders(Borders::ALL),
         ),
+        area,
+    );
+}
+
+fn draw_confirm_delete(frame: &mut Frame, area: Rect, app: &App) {
+    let title = app
+        .edit
+        .as_ref()
+        .and_then(|e| app.tasks.get(e.task_idx))
+        .map(|t| t.title.as_str())
+        .unwrap_or("(unknown task)");
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Permanently delete this task?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("This removes the task file from disk. It cannot be undone."),
+        Line::from(""),
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Y] Delete    [N] Cancel",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Delete task").borders(Borders::ALL)),
         area,
     );
 }
@@ -1088,14 +1316,11 @@ const MAX_STATUS_LINES: u16 = 10;
 /// Non-control footer context (selection label, etc.). Always above controls.
 fn footer_context(app: &App) -> Option<String> {
     match app.view {
-        View::TaskList => Some(match app.list_state.selected() {
-            Some(0) => "Create new task".to_string(),
-            Some(_) => app
-                .selected_list_task()
+        View::TaskList => Some(
+            app.selected_list_task()
                 .map(|t| format!("Selected: {}", t.title))
-                .unwrap_or_default(),
-            None => "No selection".to_string(),
-        }),
+                .unwrap_or_else(|| "No selection".to_string()),
+        ),
         View::Archive => Some(
             app.selected_archive_task()
                 .map(|t| format!("Selected: {}", t.title))
@@ -1109,14 +1334,21 @@ fn footer_context(app: &App) -> Option<String> {
 fn footer_controls(app: &App) -> String {
     match app.view {
         View::TaskList => {
-            "↑/↓ move  Enter open  E edit  I issue  P PR  R release  A archive  Shift+A archive  S settings  Q quit"
+            "↑/↓ move  Enter open  N new  E edit  I issue  P PR  R release  A archive  Shift+A archive  S settings  Q quit"
                 .to_string()
         }
         View::Archive => "↑/↓ move  U unarchive  Esc back  Q quit".to_string(),
         View::Edit => {
-            "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Enter/P set PR  Del/D clear worktree  Esc back  Q quit"
+            "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Enter/P set PR  N add note  Del/D clear/delete  Ctrl+D delete task  Esc back  Q quit"
                 .to_string()
         }
+        View::NoteDetail => {
+            "↑/↓ scroll  Ctrl+click link  Esc back  Q quit".to_string()
+        }
+        View::NoteCompose => {
+            "Type note  Enter newline  Ctrl+S save  Esc cancel".to_string()
+        }
+        View::ConfirmDelete => "Y delete  N/Esc cancel  Q quit".to_string(),
         View::Settings => "Tab/↑/↓ fields  ←/→ edit  Esc back  Q quit".to_string(),
         View::CreatePrompt => "Type / move cursor  Enter create  Esc cancel".to_string(),
         View::FieldPrompt => "Type / move cursor  Enter confirm  Esc cancel".to_string(),

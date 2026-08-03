@@ -5,7 +5,10 @@ use std::thread;
 use std::time::Duration;
 
 use color_eyre::eyre::{WrapErr, eyre};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
 use tui_textarea::{Input, Key, TextArea};
@@ -15,6 +18,7 @@ use crate::credentials;
 use crate::dirty::{self, DirtyAction, DirtyReport};
 use crate::gitutil;
 use crate::linear;
+use crate::note_util::{self, LinkHit};
 use crate::persist;
 use crate::settings::{self, Settings};
 use crate::switch;
@@ -61,6 +65,12 @@ pub enum View {
     StaleWorktree,
     /// Branch locked by another worktree during activate.
     BranchLocked,
+    /// Read-only full-text view of one task note.
+    NoteDetail,
+    /// Compose a new note for a task.
+    NoteCompose,
+    /// Confirm permanently deleting a task (from the edit view).
+    ConfirmDelete,
 }
 
 /// What to resume after the user supplies Linear credentials.
@@ -313,6 +323,8 @@ pub enum EditFocus {
     Branch,
     IssueId,
     Modules,
+    /// Task notes list (newest first).
+    Notes,
     /// Associated Treehouse worktree (clearable; not editable).
     Worktree,
 }
@@ -325,10 +337,29 @@ pub struct EditState {
     pub focus: EditFocus,
     /// Highlighted row in the available-modules list.
     pub module_cursor: usize,
+    /// Highlighted row in the notes list (sorted newest-first).
+    pub note_cursor: usize,
     pub available_modules: Vec<String>,
     pub title_input: TextArea<'static>,
     pub branch_input: TextArea<'static>,
     pub issue_input: TextArea<'static>,
+}
+
+/// Full-note viewer (read-only) opened from the edit notes list.
+#[derive(Debug)]
+pub struct NoteViewState {
+    pub task_idx: usize,
+    pub note_idx: usize,
+    pub scroll: u16,
+    /// Absolute-screen link regions filled during draw for Ctrl+click.
+    pub link_hits: Vec<LinkHit>,
+}
+
+/// Multi-line composer for a new note.
+#[derive(Debug)]
+pub struct NoteComposeState {
+    pub task_idx: usize,
+    pub input: TextArea<'static>,
 }
 
 /// In-progress switch prerequisites (modules / branch) for a task without a worktree.
@@ -360,6 +391,8 @@ pub struct App {
     pub list_state: ListState,
     pub archive_state: ListState,
     pub edit: Option<EditState>,
+    pub note_view: Option<NoteViewState>,
+    pub note_compose: Option<NoteComposeState>,
     pub settings_state: Option<SettingsState>,
     pub field_prompt: Option<FieldPromptState>,
     pub module_pr_picker: Option<ModulePrPickerState>,
@@ -401,8 +434,9 @@ impl App {
         let tasks = persist::load_all_tasks()?;
         let settings = Settings::load()?;
         let mut list_state = ListState::default();
-        // Row 0 is always "Create new task".
-        list_state.select(Some(0));
+        if tasks.iter().any(|t| !t.archived) {
+            list_state.select(Some(0));
+        }
         let mut archive_state = ListState::default();
         if tasks.iter().any(|t| t.archived) {
             archive_state.select(Some(0));
@@ -414,6 +448,8 @@ impl App {
             list_state,
             archive_state,
             edit: None,
+            note_view: None,
+            note_compose: None,
             settings_state: None,
             field_prompt: None,
             module_pr_picker: None,
@@ -498,6 +534,40 @@ impl App {
     fn handle_events(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(terminal, key)?,
+            Event::Mouse(mouse) => self.handle_mouse(mouse)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> color_eyre::Result<()> {
+        if self.view != View::NoteDetail {
+            return Ok(());
+        }
+        let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if ctrl => {
+                let Some(state) = self.note_view.as_ref() else {
+                    return Ok(());
+                };
+                if let Some(url) = note_util::hit_test(&state.link_hits, mouse.column, mouse.row) {
+                    let url = url.to_string();
+                    match settings::open_in_browser(&url) {
+                        Ok(()) => self.set_status(format!("Opened {url}")),
+                        Err(err) => self.set_error(format!("Could not open browser: {err:#}")),
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(state) = self.note_view.as_mut() {
+                    state.scroll = state.scroll.saturating_add(1);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(state) = self.note_view.as_mut() {
+                    state.scroll = state.scroll.saturating_sub(1);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -523,6 +593,9 @@ impl App {
             View::DirtyWarning => self.handle_dirty_warning_key(terminal, key)?,
             View::StaleWorktree => self.handle_stale_worktree_key(key)?,
             View::BranchLocked => self.handle_branch_locked_key(key)?,
+            View::NoteDetail => self.handle_note_view_key(key)?,
+            View::NoteCompose => self.handle_note_compose_key(key)?,
+            View::ConfirmDelete => self.handle_confirm_delete_key(key)?,
         }
         Ok(())
     }
@@ -548,6 +621,7 @@ impl App {
             KeyCode::Char('p') | KeyCode::Char('P') => self.open_pr_for_list_selection()?,
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('r') | KeyCode::Char('R') => self.release_selected(terminal)?,
+            KeyCode::Char('n') | KeyCode::Char('N') => self.open_create_prompt(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_list(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_list(),
             KeyCode::Enter => self.activate_list_selection(),
@@ -556,9 +630,9 @@ impl App {
         Ok(())
     }
 
-    /// Rows: [Create new task] + active tasks. Index 0 = create.
+    /// Active (non-archived) task rows only.
     pub fn task_list_row_count(&self) -> usize {
-        1 + self.active_tasks().count()
+        self.active_tasks().count()
     }
 
     pub fn active_tasks(&self) -> impl Iterator<Item = (usize, &Task)> {
@@ -573,12 +647,15 @@ impl App {
         self.tasks.iter().filter(|t| t.archived).count()
     }
 
-    /// Map list UI index (1..) to `tasks` index. Index 0 is Create.
+    /// Map list UI index to `tasks` index.
     fn tasks_index_for_list_row(&self, row: usize) -> Option<usize> {
-        if row == 0 {
-            return None;
-        }
-        self.active_tasks().nth(row - 1).map(|(i, _)| i)
+        self.active_tasks().nth(row).map(|(i, _)| i)
+    }
+
+    fn open_create_prompt(&mut self) {
+        self.create_input = text_input::single_line("");
+        self.view = View::CreatePrompt;
+        self.clear_status();
     }
 
     pub fn selected_list_task(&self) -> Option<&Task> {
@@ -609,20 +686,13 @@ impl App {
     }
 
     fn activate_list_selection(&mut self) {
-        match self.list_state.selected() {
-            Some(0) => {
-                self.create_input = text_input::single_line("");
-                self.view = View::CreatePrompt;
-                self.clear_status();
-            }
-            Some(row) => {
-                if let Some(task_idx) = self.tasks_index_for_list_row(row)
-                    && let Err(err) = self.start_switch(task_idx)
-                {
-                    self.set_error(format!("Switch failed: {err:#}"));
-                }
-            }
-            None => {}
+        let Some(row) = self.list_state.selected() else {
+            return;
+        };
+        if let Some(task_idx) = self.tasks_index_for_list_row(row)
+            && let Err(err) = self.start_switch(task_idx)
+        {
+            self.set_error(format!("Switch failed: {err:#}"));
         }
     }
 
@@ -638,28 +708,16 @@ impl App {
     }
 
     fn open_edit_for_list_selection(&mut self) -> color_eyre::Result<()> {
-        let Some(row) = self.list_state.selected() else {
-            return Ok(());
-        };
-        if row == 0 {
+        let Some(task_idx) = self.selected_list_task_idx() else {
             self.set_error("Select a task to edit");
-            return Ok(());
-        }
-        let Some(task_idx) = self.tasks_index_for_list_row(row) else {
             return Ok(());
         };
         self.open_edit(task_idx, View::TaskList)
     }
 
     fn archive_selected(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
-        let Some(row) = self.list_state.selected() else {
-            return Ok(());
-        };
-        if row == 0 {
+        let Some(task_idx) = self.selected_list_task_idx() else {
             self.set_error("Select a task to archive");
-            return Ok(());
-        }
-        let Some(task_idx) = self.tasks_index_for_list_row(row) else {
             return Ok(());
         };
 
@@ -671,14 +729,8 @@ impl App {
     }
 
     fn release_selected(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
-        let Some(row) = self.list_state.selected() else {
-            return Ok(());
-        };
-        if row == 0 {
+        let Some(task_idx) = self.selected_list_task_idx() else {
             self.set_error("Select a task to release its worktree");
-            return Ok(());
-        }
-        let Some(task_idx) = self.tasks_index_for_list_row(row) else {
             return Ok(());
         };
 
@@ -964,6 +1016,7 @@ impl App {
             return_to,
             focus: EditFocus::Title,
             module_cursor: 0,
+            note_cursor: 0,
             available_modules,
             title_input,
             branch_input,
@@ -990,6 +1043,18 @@ impl App {
 
         // Keys that navigate the edit form (not passed into text fields).
         match (focus, &input) {
+            (
+                _,
+                Input {
+                    key: Key::Char('d' | 'D'),
+                    ctrl: true,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.open_confirm_delete()?;
+                return Ok(());
+            }
             (_, Input { key: Key::Esc, .. }) => {
                 self.leave_edit();
                 return Ok(());
@@ -1042,6 +1107,32 @@ impl App {
                 self.edit_module_move_or_leave(-1);
                 return Ok(());
             }
+            (Some(EditFocus::Notes), Input { key: Key::Down, .. })
+            | (
+                Some(EditFocus::Notes),
+                Input {
+                    key: Key::Char('j'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.edit_note_move_or_leave(1);
+                return Ok(());
+            }
+            (Some(EditFocus::Notes), Input { key: Key::Up, .. })
+            | (
+                Some(EditFocus::Notes),
+                Input {
+                    key: Key::Char('k'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.edit_note_move_or_leave(-1);
+                return Ok(());
+            }
             (
                 Some(EditFocus::Worktree),
                 Input {
@@ -1061,6 +1152,37 @@ impl App {
                 self.clear_edit_worktree_association(terminal)?;
                 return Ok(());
             }
+            (
+                Some(EditFocus::Notes),
+                Input {
+                    key: Key::Delete | Key::Backspace,
+                    ..
+                },
+            )
+            | (
+                Some(EditFocus::Notes),
+                Input {
+                    key: Key::Char('d' | 'D'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.delete_selected_note()?;
+                return Ok(());
+            }
+            (
+                Some(EditFocus::Modules | EditFocus::Notes | EditFocus::Worktree),
+                Input {
+                    key: Key::Char('n' | 'N' | 'a' | 'A'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.open_note_compose()?;
+                return Ok(());
+            }
             // Up/Down move between fields even while a text input is focused.
             (_, Input { key: Key::Down, .. }) => {
                 self.edit_focus_next();
@@ -1078,6 +1200,8 @@ impl App {
             ) => {
                 if focus == Some(EditFocus::Modules) {
                     self.edit_module_pr()?;
+                } else if focus == Some(EditFocus::Notes) {
+                    self.open_note_view()?;
                 } else {
                     self.edit_confirm_field()?;
                 }
@@ -1108,7 +1232,7 @@ impl App {
                 return Ok(());
             }
             (
-                Some(EditFocus::Modules | EditFocus::Worktree),
+                Some(EditFocus::Modules | EditFocus::Notes | EditFocus::Worktree),
                 Input {
                     key: Key::Char('q' | 'Q'),
                     ctrl: false,
@@ -1144,7 +1268,7 @@ impl App {
             EditFocus::Title => edit.title_input.input(input),
             EditFocus::Branch => edit.branch_input.input(input),
             EditFocus::IssueId => edit.issue_input.input(input),
-            EditFocus::Modules | EditFocus::Worktree => false,
+            EditFocus::Modules | EditFocus::Notes | EditFocus::Worktree => false,
         };
         if modified {
             self.sync_edit_inputs_to_task()?;
@@ -1163,7 +1287,255 @@ impl App {
         self.clear_status();
     }
 
+    fn open_confirm_delete(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let Some(task) = self.tasks.get(edit.task_idx) else {
+            self.set_error("Task missing");
+            return Ok(());
+        };
+        if task.worktree.is_some() {
+            self.set_error(
+                "Release the worktree first (Esc, then R on the task list), or clear the association in the Worktree field",
+            );
+            return Ok(());
+        }
+        self.view = View::ConfirmDelete;
+        self.clear_status();
+        Ok(())
+    }
+
+    fn handle_confirm_delete_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.confirm_delete_task()?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.view = View::Edit;
+                self.clear_status();
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn confirm_delete_task(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            self.view = View::TaskList;
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        let return_to = edit.return_to;
+        let Some(task) = self.tasks.get(task_idx) else {
+            self.edit = None;
+            self.view = return_to;
+            self.set_error("Task missing");
+            return Ok(());
+        };
+        if task.worktree.is_some() {
+            self.view = View::Edit;
+            self.set_error(
+                "Release the worktree first (Esc, then R on the task list), or clear the association in the Worktree field",
+            );
+            return Ok(());
+        }
+
+        let stem = task.file_stem.clone();
+        let title = task.title.clone();
+        persist::delete_task(&stem)?;
+        self.tasks.remove(task_idx);
+        self.edit = None;
+        self.view = match return_to {
+            View::Archive => View::Archive,
+            _ => View::TaskList,
+        };
+        self.clamp_list_selection();
+        self.clamp_archive_selection();
+        self.set_status(format!("Deleted task: {title}"));
+        Ok(())
+    }
+
+    fn open_note_view(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        let note_idx = edit.note_cursor;
+        let Some(task) = self.tasks.get(task_idx) else {
+            return Ok(());
+        };
+        if task.notes.is_empty() {
+            self.set_status("No notes yet — press N to add one");
+            return Ok(());
+        }
+        if note_idx >= task.notes.len() {
+            self.set_error("No note selected");
+            return Ok(());
+        }
+        self.note_view = Some(NoteViewState {
+            task_idx,
+            note_idx,
+            scroll: 0,
+            link_hits: Vec::new(),
+        });
+        self.view = View::NoteDetail;
+        self.clear_status();
+        Ok(())
+    }
+
+    fn open_note_compose(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        self.note_compose = Some(NoteComposeState {
+            task_idx,
+            input: text_input::multi_line(""),
+        });
+        self.view = View::NoteCompose;
+        self.set_status("Write a note — Ctrl+S save, Esc cancel");
+        Ok(())
+    }
+
+    fn delete_selected_note(&mut self) -> color_eyre::Result<()> {
+        let Some(edit) = self.edit.as_ref() else {
+            return Ok(());
+        };
+        let task_idx = edit.task_idx;
+        let note_idx = edit.note_cursor;
+        let Some(task) = self.tasks.get_mut(task_idx) else {
+            return Ok(());
+        };
+        if note_idx >= task.notes.len() {
+            self.set_error("No note to delete");
+            return Ok(());
+        }
+        task.notes.remove(note_idx);
+        task.touch();
+        persist::save_task(task)?;
+        let new_len = task.notes.len();
+        self.sort_tasks_preserving_edit(task_idx)?;
+        if let Some(edit) = self.edit.as_mut() {
+            if new_len == 0 {
+                edit.note_cursor = 0;
+            } else {
+                edit.note_cursor = note_idx.min(new_len - 1);
+            }
+        }
+        self.set_status("Note deleted");
+        Ok(())
+    }
+
+    fn handle_note_view_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
+                self.note_view = None;
+                self.view = View::Edit;
+                self.clear_status();
+            }
+            Input { key: Key::Up, .. }
+            | Input {
+                key: Key::Char('k'),
+                ctrl: false,
+                alt: false,
+                ..
+            } => {
+                if let Some(state) = self.note_view.as_mut() {
+                    state.scroll = state.scroll.saturating_sub(1);
+                }
+            }
+            Input { key: Key::Down, .. }
+            | Input {
+                key: Key::Char('j'),
+                ctrl: false,
+                alt: false,
+                ..
+            } => {
+                if let Some(state) = self.note_view.as_mut() {
+                    state.scroll = state.scroll.saturating_add(1);
+                }
+            }
+            Input {
+                key: Key::Char('q' | 'Q'),
+                ctrl: false,
+                alt: false,
+                ..
+            } => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_note_compose_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
+                self.note_compose = None;
+                self.view = View::Edit;
+                self.clear_status();
+            }
+            Input {
+                key: Key::Char('s'),
+                ctrl: true,
+                ..
+            } => {
+                self.save_note_compose()?;
+            }
+            Input {
+                key: Key::Char('q' | 'Q'),
+                ctrl: true,
+                ..
+            } => {
+                // Allow Ctrl+Q to quit; bare Q types into the note.
+                self.should_quit = true;
+            }
+            input => {
+                if let Some(state) = self.note_compose.as_mut() {
+                    state.input.input(input);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn save_note_compose(&mut self) -> color_eyre::Result<()> {
+        let Some(state) = self.note_compose.as_ref() else {
+            return Ok(());
+        };
+        let task_idx = state.task_idx;
+        let body = text_input::multi_value(&state.input);
+        if body.trim().is_empty() {
+            self.set_error("Note is empty — write something or Esc to cancel");
+            return Ok(());
+        }
+        let Some(task) = self.tasks.get_mut(task_idx) else {
+            return Ok(());
+        };
+        task.add_note(body);
+        task.touch();
+        persist::save_task(task)?;
+        self.note_compose = None;
+        self.sort_tasks_preserving_edit(task_idx)?;
+        if let Some(edit) = self.edit.as_mut() {
+            edit.focus = EditFocus::Notes;
+            edit.note_cursor = 0; // newest first
+        }
+        self.view = View::Edit;
+        self.set_status("Note saved");
+        Ok(())
+    }
+
     fn edit_focus_next(&mut self) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let task_idx = edit.task_idx;
+        let notes_len = self.tasks.get(task_idx).map(|t| t.notes.len()).unwrap_or(0);
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
@@ -1171,7 +1543,8 @@ impl App {
             EditFocus::Title => EditFocus::Branch,
             EditFocus::Branch => EditFocus::IssueId,
             EditFocus::IssueId => EditFocus::Modules,
-            EditFocus::Modules => EditFocus::Worktree,
+            EditFocus::Modules => EditFocus::Notes,
+            EditFocus::Notes => EditFocus::Worktree,
             EditFocus::Worktree => EditFocus::Title,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
@@ -1179,27 +1552,50 @@ impl App {
                 .module_cursor
                 .min(edit.available_modules.len().saturating_sub(1));
         }
+        if edit.focus == EditFocus::Notes {
+            if notes_len > 0 {
+                edit.note_cursor = edit.note_cursor.min(notes_len - 1);
+            } else {
+                edit.note_cursor = 0;
+            }
+        }
     }
 
     fn edit_focus_prev(&mut self) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let task_idx = edit.task_idx;
+        let notes_len = self.tasks.get(task_idx).map(|t| t.notes.len()).unwrap_or(0);
+        let from_worktree = edit.focus == EditFocus::Worktree;
+        let from_notes = edit.focus == EditFocus::Notes;
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
-        let from_worktree = edit.focus == EditFocus::Worktree;
         edit.focus = match edit.focus {
             EditFocus::Title => EditFocus::Worktree,
             EditFocus::Branch => EditFocus::Title,
             EditFocus::IssueId => EditFocus::Branch,
             EditFocus::Modules => EditFocus::IssueId,
-            EditFocus::Worktree => EditFocus::Modules,
+            EditFocus::Notes => EditFocus::Modules,
+            EditFocus::Worktree => EditFocus::Notes,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
-            if from_worktree {
+            if from_notes {
                 edit.module_cursor = edit.available_modules.len() - 1;
             } else {
                 edit.module_cursor = edit
                     .module_cursor
                     .min(edit.available_modules.len().saturating_sub(1));
+            }
+        }
+        if edit.focus == EditFocus::Notes {
+            if notes_len == 0 {
+                edit.note_cursor = 0;
+            } else if from_worktree {
+                edit.note_cursor = notes_len - 1;
+            } else {
+                edit.note_cursor = edit.note_cursor.min(notes_len - 1);
             }
         }
     }
@@ -1233,6 +1629,39 @@ impl App {
         edit.module_cursor = ((cur as i32) + delta) as usize;
     }
 
+    /// Move within the notes list; leave to adjacent fields at the edges.
+    fn edit_note_move_or_leave(&mut self, delta: i32) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        let len = self
+            .tasks
+            .get(edit.task_idx)
+            .map(|t| t.notes.len())
+            .unwrap_or(0);
+        if len == 0 {
+            if delta > 0 {
+                self.edit_focus_next();
+            } else {
+                self.edit_focus_prev();
+            }
+            return;
+        }
+        let cur = edit.note_cursor;
+        if delta > 0 && cur + 1 >= len {
+            self.edit_focus_next();
+            return;
+        }
+        if delta < 0 && cur == 0 {
+            self.edit_focus_prev();
+            return;
+        }
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+        edit.note_cursor = ((cur as i32) + delta) as usize;
+    }
+
     fn edit_confirm_field(&mut self) -> color_eyre::Result<()> {
         let Some(edit) = self.edit.as_ref() else {
             return Ok(());
@@ -1242,8 +1671,8 @@ impl App {
                 // Text already persisted on each keystroke; Enter advances focus.
                 self.edit_focus_next();
             }
-            EditFocus::Modules | EditFocus::Worktree => {
-                // Enter on modules is handled by edit_module_pr; worktree: no-op.
+            EditFocus::Modules | EditFocus::Notes | EditFocus::Worktree => {
+                // Enter on modules/notes handled elsewhere; worktree: no-op.
             }
         }
         Ok(())
@@ -2350,7 +2779,7 @@ impl App {
             .active_tasks()
             .enumerate()
             .find(|(_, (_, task))| task.file_stem == stem)
-            .map(|(row_offset, _)| row_offset + 1); // +1: row 0 is Create
+            .map(|(row, _)| row);
         if let Some(row) = row {
             self.list_state.select(Some(row));
         }

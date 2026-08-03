@@ -30,9 +30,19 @@ tod always uses the **current working directory** as the main git repository. Av
 | Issue ID | string? | Optional tracker issue ID (e.g. from Linear) |
 | Module PRs | map of string → integer | Optional PR number per associated module (module name = repository in the PR URL template). May be filled from Linear attachments matched by repo name |
 | Modules | list of string | Required; may be empty. See [Modules](#modules) |
+| Notes | list of Note | Optional; free-form notes on the task. Sorted **newest first** in the edit view. See [Notes](#notes) |
 | Worktree | Worktree? | Optional; tracked automatically (not set in the edit view). See [Worktree](#worktree) |
 | Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
 | Archived | bool | When true, the task appears only in the [Archive view](#2-archive-view), not the main list |
+
+### Notes
+
+Each note has:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| Body | string | Free-form text (may be multi-line; may contain `http://` / `https://` URLs) |
+| Created at | timestamp | Used for newest-first ordering |
 
 ### Modules
 
@@ -79,7 +89,7 @@ Keybindings are fixed for now (not user-remappable).
 
 ### 1. Task list (main / initial view)
 
-Active (non-archived) tasks, sorted by **last used descending**. The first row is **Create new task**.
+Active (non-archived) tasks, sorted by **last used descending**.
 
 Each task row shows:
 
@@ -90,7 +100,8 @@ Each task row shows:
 | Key | Action |
 | --- | --- |
 | ↑ / ↓ | Move selection |
-| Enter | On a task: [switch](#switch-to-a-task). On **Create new task**: [create new task](#create-new-task). |
+| Enter | [Switch](#switch-to-a-task) to the selected task |
+| N | [Create new task](#create-new-task) |
 | E | Open [Edit view](#3-edit-view) for the selected task |
 | I | [Open issue](#open-issue) for the selected task in the browser |
 | P | [Open PR](#open-pr) for the selected task in the browser |
@@ -121,6 +132,7 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 - branch
 - issue ID
 - **modules** — multiselect of available modules (main repo name + each submodule name); each selected module may have a PR number (Enter / P while focused on the module)
+- **notes** — list of notes, newest first; each row shows a one-line truncated preview
 
 **Display only**
 
@@ -128,11 +140,26 @@ Edit a task’s editable fields; show read-only worktree info. Field changes upd
 
 | Key | Action |
 | --- | --- |
-| Tab / ↑ / ↓ | Move between fields (and within the modules list) |
-| Enter | Confirm the current text field (title / branch / issue ID). On modules: set/edit that module’s PR number |
+| Tab / ↑ / ↓ | Move between fields (and within the modules / notes lists) |
+| Enter | Confirm the current text field (title / branch / issue ID). On modules: set/edit that module’s PR number. On notes: open the full note |
 | Space | Toggle the highlighted module on/off (clears that module’s PR when unchecked) |
+| N / A | Add a new note (opens the note composer; Ctrl+S saves, Esc cancels) |
+| Del / D | On notes: delete the highlighted note. On worktree: clear the association |
 | Esc | Return to the previous view |
 | Q | Quit |
+
+#### Full note view
+
+Opened with Enter on a note in the edit list. Shows the full body; URLs are underlined.
+
+| Key / input | Action |
+| --- | --- |
+| ↑ / ↓ | Scroll |
+| Ctrl+click | Open the clicked `http(s)` URL in the system browser |
+| Esc | Return to the edit view |
+| Q | Quit |
+
+---
 
 ### 4. Settings view
 
@@ -155,7 +182,7 @@ Edit URL templates used when opening issues and PRs. Changes persist immediately
 
 ### Create new task
 
-From the task list: select **Create new task**, press Enter, then enter a single line. Parse in order of specificity:
+From the task list: press **N**, then enter a single line. Parse in order of specificity:
 
 1. **Issue ID** — matches `^[A-Za-z]{1,32}-[0-9]{1,32}$` (e.g. `ABC-123`). Look up in Linear, use the issue title as the task title, store the issue ID. May prompt for Linear credentials ([Integrations](#integrations--credentials)).
 2. **Branch name** — matches a prefix, a `/`, then a git-valid suffix:
