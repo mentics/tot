@@ -22,12 +22,14 @@ Progress and decisions while implementing `doc/features.md`.
 
 **Completed**
 - `Task.waiting` bool (`#[serde(default)]`, default false); stays active when set.
-- Main list **W** toggles waiting: touch + persist + sort + reselect by stem (no worktree release).
+- Main list **W** toggles waiting: touch + persist + sort (no worktree release).
+- Marking waiting: selection moves to nearest remaining non-waiting (prefer below, else above); if none left, first waiting task. Clearing waiting: selection follows that task.
 - When any active task is waiting: non-waiting → dim `── waiting ──` divider → waiting; ↑/↓ skip divider. No divider when none waiting.
 - Archive view unchanged; waiting ignored while archived.
 
 **Decisions**
 - No separate Waiting view, status enum, or per-row waiting badge (divider only).
+- Marking waiting does not follow the task into the waiting block.
 
 **Blockers:** none.
 

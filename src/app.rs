@@ -745,18 +745,62 @@ impl App {
         };
 
         let stem = self.tasks[task_idx].file_stem.clone();
+        let marking_waiting = !self.tasks[task_idx].waiting;
+
+        // When marking waiting, leave selection on the nearest remaining non-waiting
+        // task (prefer the one that was below, else above). If none remain, select
+        // the first waiting task. When clearing waiting, follow the task up.
+        let select_stem = if marking_waiting {
+            let non_waiting: Vec<String> = self
+                .active_tasks()
+                .filter(|(_, t)| !t.waiting)
+                .map(|(_, t)| t.file_stem.clone())
+                .collect();
+            non_waiting.iter().position(|s| s == &stem).and_then(|i| {
+                non_waiting
+                    .get(i + 1)
+                    .or_else(|| i.checked_sub(1).and_then(|j| non_waiting.get(j)))
+                    .cloned()
+            })
+        } else {
+            Some(stem.clone())
+        };
+
         self.tasks[task_idx].waiting = !self.tasks[task_idx].waiting;
         let waiting = self.tasks[task_idx].waiting;
         self.tasks[task_idx].touch();
         persist::save_task(&self.tasks[task_idx])?;
         self.sort_tasks();
-        self.select_active_task_by_stem(&stem);
+
+        if let Some(ref target) = select_stem {
+            self.select_active_task_by_stem(target);
+        } else {
+            self.select_first_waiting_task();
+        }
+
         self.set_status(if waiting {
             "Marked waiting"
         } else {
             "Cleared waiting"
         });
         Ok(())
+    }
+
+    /// Select the first waiting task on the main list (top of the waiting block).
+    fn select_first_waiting_task(&mut self) {
+        let row = self
+            .task_list_rows()
+            .iter()
+            .enumerate()
+            .find_map(|(row, r)| match r {
+                TaskListRow::Task(i) if self.tasks[*i].waiting => Some(row),
+                _ => None,
+            });
+        if let Some(row) = row {
+            self.list_state.select(Some(row));
+        } else {
+            self.clamp_list_selection();
+        }
     }
 
     fn activate_list_selection(&mut self) {
@@ -2858,12 +2902,14 @@ impl App {
     }
 
     fn select_active_task_by_stem(&mut self, stem: &str) {
-        let row = self.task_list_rows().iter().enumerate().find_map(|(row, r)| {
-            match r {
+        let row = self
+            .task_list_rows()
+            .iter()
+            .enumerate()
+            .find_map(|(row, r)| match r {
                 TaskListRow::Task(i) if self.tasks[*i].file_stem == stem => Some(row),
                 _ => None,
-            }
-        });
+            });
         if let Some(row) = row {
             self.list_state.select(Some(row));
         }

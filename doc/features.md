@@ -278,7 +278,8 @@ From the task list, press **A** on a task:
 From the task list, press **W** on a task:
 
 1. Flip `Waiting`, update **last used**, persist.
-2. Re-sort the main list and keep selection on that task (by file stem). Does **not** release a worktree; the task stays active.
+2. Re-sort the main list. Does **not** release a worktree; the task stays active.
+3. Selection: when **marking** waiting, move to the nearest remaining non-waiting task (prefer the one that was immediately below, else above). If no non-waiting tasks remain, select the first waiting task. When **clearing** waiting, keep selection on that task (it moves above the divider).
 
 Waiting tasks remain on the main list under the waiting divider. Archive view does not interpret waiting (leave the field unchanged while archived).
 
